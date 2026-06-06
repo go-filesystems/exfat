@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	filesystem "github.com/go-filesystems/interface"
@@ -96,6 +97,11 @@ type exfatFS struct {
 	partOffset int64
 	info       Info
 	label      string
+	// Allocation-bitmap location, discovered from the root directory at
+	// Open time. bitmapCluster == 0 means no bitmap was found (legal for
+	// older / minimal images that this driver also tolerates reading).
+	bitmapCluster uint32
+	bitmapLength  uint64
 }
 
 var (
@@ -129,7 +135,41 @@ func Open(imagePath string, partIndex int) (filesystem.Filesystem, error) {
 	if lbl, err := readVolumeLabel(f, info, off); err == nil {
 		fs.label = lbl
 	}
+	// Best-effort discovery of the Allocation Bitmap system file so that
+	// later WriteFile / DeleteFile / MkDir calls can keep the bitmap in
+	// sync with the FAT. A missing bitmap is non-fatal: the writer will
+	// simply skip bitmap updates, which yields a still-readable image
+	// that just won't pass the strictest fsck variants.
+	if bc, bl, err := findBitmap(f, info, off); err == nil && bc >= 2 {
+		fs.bitmapCluster = bc
+		fs.bitmapLength = bl
+	}
 	return fs, nil
+}
+
+// findBitmap scans the first cluster of the root directory looking for
+// the Allocation Bitmap system file entry (type 0x81). On success it
+// returns (firstCluster, dataLengthBytes). The driver tolerates images
+// that lack a bitmap entry — a fresh image produced by an older mkfs
+// might omit it — by returning (0, 0, nil).
+func findBitmap(rd diskRW, info Info, partOffset int64) (uint32, uint64, error) {
+	off := info.RootDirOffset(partOffset)
+	buf := make([]byte, info.ClusterSize())
+	if _, err := rd.ReadAt(buf, off); err != nil {
+		return 0, 0, fmt.Errorf("exfat: read root directory: %w", err)
+	}
+	le := binary.LittleEndian
+	for offset := 0; offset+dirEntrySize <= len(buf); offset += dirEntrySize {
+		switch buf[offset] {
+		case exfatEntryEnd:
+			return 0, 0, nil
+		case 0x81: // Allocation Bitmap
+			cluster := le.Uint32(buf[offset+20 : offset+24])
+			length := le.Uint64(buf[offset+24 : offset+32])
+			return cluster, length, nil
+		}
+	}
+	return 0, 0, nil
 }
 
 // Close releases the underlying file handle.
@@ -527,6 +567,20 @@ func readInfo(r io.ReaderAt, partOffset int64) (Info, error) {
 }
 
 func partitionOffset(r io.ReaderAt, partIndex int) (int64, error) {
+	// When the caller explicitly asks for an auto-detected partition (partIndex == -1)
+	// and the image already starts with a raw exFAT boot sector (OEM name "EXFAT   "
+	// at bytes 3..11), treat it as a non-partitioned image. Real exFAT volumes also
+	// carry the 0x55 0xAA signature at offset 510, which would otherwise be
+	// misidentified as an MBR by the heuristic below — yielding garbage start-LBA
+	// values when the MBR-equivalent bytes (446..509) contain non-zero data put
+	// there by the formatter (e.g. macOS newfs_exfat).
+	if partIndex < 0 {
+		var oem [8]byte
+		if _, err := r.ReadAt(oem[:], 3); err == nil && string(oem[:]) == "EXFAT   " {
+			return 0, nil
+		}
+	}
+
 	var sig [8]byte
 	if _, err := r.ReadAt(sig[:], sectorSize); err == nil && string(sig[:]) == "EFI PART" {
 		return gptPartOffset(r, partIndex)
@@ -853,6 +907,7 @@ func (fs *exfatFS) writeData(data []byte) (uint32, error) {
 		if err != nil {
 			for _, ac := range allocated[:i] {
 				_ = fs.setFATEntry(ac, 0)
+				_ = fs.setBitmapBit(ac, false)
 			}
 			return 0, err
 		}
@@ -887,6 +942,8 @@ func (fs *exfatFS) writeData(data []byte) (uint32, error) {
 }
 
 // allocCluster scans the FAT and returns the first free cluster number (≥ 2).
+// When the Allocation Bitmap was located by Open, the cluster is also marked
+// as allocated in the bitmap so the FAT and bitmap stay consistent.
 func (fs *exfatFS) allocCluster() (uint32, error) {
 	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
 	var buf [4]byte
@@ -895,10 +952,45 @@ func (fs *exfatFS) allocCluster() (uint32, error) {
 			return 0, fmt.Errorf("exfat: read FAT entry: %w", err)
 		}
 		if binary.LittleEndian.Uint32(buf[:]) == 0 {
+			if err := fs.setBitmapBit(c, true); err != nil {
+				return 0, err
+			}
 			return c, nil
 		}
 	}
 	return 0, fmt.Errorf("exfat: no free clusters")
+}
+
+// setBitmapBit toggles the bitmap bit corresponding to cluster c. The
+// bitmap stores one bit per cluster starting at cluster 2 (so bit 0 is
+// cluster 2, bit 1 is cluster 3, …). Silently noop when no bitmap was
+// found at Open time, when c is out of range, or when c falls past the
+// recorded bitmap length.
+func (fs *exfatFS) setBitmapBit(c uint32, allocated bool) error {
+	if fs.bitmapCluster < 2 || c < 2 {
+		return nil
+	}
+	bitIndex := uint64(c - 2)
+	byteIndex := bitIndex / 8
+	if byteIndex >= fs.bitmapLength {
+		return nil
+	}
+	mask := byte(1 << (bitIndex % 8))
+	dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
+	off := dataBase + int64(fs.bitmapCluster-2)*int64(fs.info.ClusterSize()) + int64(byteIndex)
+	var current [1]byte
+	if _, err := fs.f.ReadAt(current[:], off); err != nil {
+		return fmt.Errorf("exfat: read allocation bitmap byte %d: %w", byteIndex, err)
+	}
+	if allocated {
+		current[0] |= mask
+	} else {
+		current[0] &^= mask
+	}
+	if _, err := fs.f.WriteAt(current[:], off); err != nil {
+		return fmt.Errorf("exfat: write allocation bitmap byte %d: %w", byteIndex, err)
+	}
+	return nil
 }
 
 // setFATEntry writes a 32-bit FAT entry for cluster.
@@ -913,7 +1005,9 @@ func (fs *exfatFS) setFATEntry(cluster uint32, value uint32) error {
 	return nil
 }
 
-// freeChain marks every cluster in the FAT chain starting at start as free.
+// freeChain marks every cluster in the FAT chain starting at start as free,
+// and (when a bitmap is present) clears their bitmap bits to keep the FAT
+// and Allocation Bitmap in sync.
 func (fs *exfatFS) freeChain(start uint32) error {
 	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
 	cluster := start
@@ -924,6 +1018,9 @@ func (fs *exfatFS) freeChain(start uint32) error {
 		}
 		nextCluster := binary.LittleEndian.Uint32(next[:])
 		if err := fs.setFATEntry(cluster, 0); err != nil {
+			return err
+		}
+		if err := fs.setBitmapBit(cluster, false); err != nil {
 			return err
 		}
 		if nextCluster >= 0xFFFFFFF8 {
@@ -940,6 +1037,13 @@ func (fs *exfatFS) writeRootDir(buf []byte) error {
 }
 
 // makeExFATEntrySet creates a checksummed exFAT directory entry set.
+//
+// The file entry's three mandatory timestamps (CreateTimestamp,
+// LastModifiedTimestamp, LastAccessedTimestamp) are populated with the
+// current local time encoded in the exFAT timestamp format (see
+// exfatNowTimestamp). Apple's fsck_exfat rejects entries whose timestamps
+// have an out-of-range Month or Day field — leaving them zero (=> month
+// 0, day 0) yields an "Invalid file name in /" report.
 func makeExFATEntrySet(name string, attrs uint16, cluster uint32, size uint64) []byte {
 	nameWords := utf16.Encode([]rune(name))
 	numNameEntries := (len(nameWords) + nameCharsPerEntry - 1) / nameCharsPerEntry
@@ -951,9 +1055,17 @@ func makeExFATEntrySet(name string, attrs uint16, cluster uint32, size uint64) [
 	buf[1] = secondaryCount
 	le.PutUint16(buf[4:6], attrs)
 
+	ts := exfatNowTimestamp()
+	le.PutUint32(buf[8:12], ts)  // CreateTimestamp
+	le.PutUint32(buf[12:16], ts) // LastModifiedTimestamp
+	le.PutUint32(buf[16:20], ts) // LastAccessedTimestamp
+
 	s := buf[dirEntrySize:]
 	s[0] = exfatEntryStream
-	s[1] = 1 // allocationPossible
+	// GeneralSecondaryFlags = AllocationPossible (bit 0). We deliberately
+	// leave NoFatChain (bit 1) clear: the FAT contains the canonical chain
+	// for every file we emit, so external implementations can rely on it.
+	s[1] = 1
 	s[3] = uint8(len(nameWords))
 	le.PutUint16(s[4:6], exfatNameHash(name))
 	le.PutUint64(s[8:16], size)
@@ -975,6 +1087,40 @@ func makeExFATEntrySet(name string, attrs uint16, cluster uint32, size uint64) [
 
 	le.PutUint16(buf[2:4], exfatEntrySetChecksum(buf))
 	return buf
+}
+
+// exfatNowTimestamp returns the current local time encoded in the exFAT
+// 32-bit timestamp format (Microsoft exFAT spec section 7.4.8):
+//
+//	bits 31..25 = Year   (0 = 1980, 127 = 2107)
+//	bits 24..21 = Month  (1..12)
+//	bits 20..16 = Day    (1..31)
+//	bits 15..11 = Hour   (0..23)
+//	bits 10..5  = Minute (0..59)
+//	bits  4..0  = DoubleSeconds (0..29 == 0..58s)
+//
+// We clamp values defensively so the encoded stamp is always valid even
+// when the host clock is set before 1980 or after 2107.
+func exfatNowTimestamp() uint32 {
+	return exfatEncodeTimestamp(timeNow())
+}
+
+// timeNow is a package-level seam so tests can pin a deterministic value.
+var timeNow = func() time.Time { return time.Now() }
+
+func exfatEncodeTimestamp(t time.Time) uint32 {
+	year := t.Year()
+	if year < 1980 {
+		year = 1980
+	} else if year > 2107 {
+		year = 2107
+	}
+	return (uint32(year-1980) << 25) |
+		(uint32(t.Month()) << 21) |
+		(uint32(t.Day()) << 16) |
+		(uint32(t.Hour()) << 11) |
+		(uint32(t.Minute()) << 5) |
+		(uint32(t.Second()) / 2)
 }
 
 // exfatNameHash computes the exFAT name hash for an uppercase UTF-16LE name.

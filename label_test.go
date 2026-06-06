@@ -108,16 +108,35 @@ func TestExfatSetLabel_EmptyMarksUnusedEntry(t *testing.T) {
 		t.Errorf("after clearing, Label() = %q, want empty", got)
 	}
 
-	// Also verify entry 0 type byte is 0x03 (not-in-use) — sanity-check
-	// that the on-disk format is the kernel-canonical one.
+	// Also verify the Volume Label slot in the root directory is now
+	// stored as 0x03 (not-in-use) — sanity-check that the on-disk format
+	// is the kernel-canonical one. The label entry isn't necessarily at
+	// offset 0 anymore (the Bitmap and Up-case Table system files sit
+	// ahead of it), so we scan for it.
 	bf := fs2.(*exfatFS)
 	rootOff := bf.info.RootDirOffset(bf.partOffset)
-	buf := make([]byte, 32)
+	buf := make([]byte, bf.info.ClusterSize())
 	if _, err := bf.f.ReadAt(buf, rootOff); err != nil {
-		t.Fatalf("read root entry 0: %v", err)
+		t.Fatalf("read root cluster: %v", err)
 	}
-	if buf[0] != exfatEntryVolumeLabelUnused {
-		t.Errorf("root entry 0 type = 0x%02x, want 0x%02x (not-in-use)", buf[0], exfatEntryVolumeLabelUnused)
+	found := false
+	for offset := 0; offset+dirEntrySize <= len(buf); offset += dirEntrySize {
+		switch buf[offset] {
+		case exfatEntryVolumeLabel:
+			t.Errorf("root entry at offset %d type = 0x%02x, want 0x%02x (not-in-use)", offset, buf[offset], exfatEntryVolumeLabelUnused)
+			found = true
+		case exfatEntryVolumeLabelUnused:
+			found = true
+		}
+		if found {
+			break
+		}
+		if buf[offset] == exfatEntryEnd {
+			break
+		}
+	}
+	if !found {
+		t.Errorf("no Volume Label slot found in root directory after clearing")
 	}
 }
 

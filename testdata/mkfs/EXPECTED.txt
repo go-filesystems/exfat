@@ -1,0 +1,24 @@
+# Canonical exFAT fixture produced by macOS newfs_exfat.
+#
+# Generation (see compat_test.go: regenerateMkfsImage):
+#
+#   newfs_exfat -v EXFATTEST <attached raw 512 KiB image>
+#   mkdir -p /sub
+#   printf 'hello\n' > /hello.txt
+#   dd if=/dev/zero bs=1024 count=1 | tr '\0' 'A' > /sub/blob.bin
+#   # AppleDouble side-cars and .fseventsd are stripped before commit.
+#
+# Format:
+#   <md5sum>  <size_bytes>  <path>
+#
+# Image (decompressed): 524288 bytes total. The image-level md5 below is the
+# committed snapshot; regenerated fixtures pin all four file-level hashes
+# below but may differ at the image level due to newfs_exfat randomising the
+# volume serial number each invocation.
+fd5a09147611b6ad05d885c5a94b11f6  524288  image.exfat  (committed snapshot)
+#
+# Files inside the image:
+b1946ac92492d2347c6235b4d2611184       6  /hello.txt
+d47b127bc2de2d687ddc82dac354c415    1024  /sub/blob.bin
+#
+# Volume label: EXFATTEST

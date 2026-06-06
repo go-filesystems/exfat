@@ -27,19 +27,35 @@ func (fs *exfatFS) Label() string {
 	return fs.label
 }
 
-// SetLabel writes a new Volume Label entry at offset 0 of the root
-// directory cluster. The label is capped at MaxLabelLen UTF-16 code
-// units. An empty label writes a "not-in-use" marker (entry type
-// 0x03) — kernel and Windows treat both as "no label".
+// findLabelSlot scans the root directory cluster looking for an existing
+// Volume Label entry (0x83 or 0x03). If one is found, its byte offset
+// within the cluster is returned. Otherwise findLabelSlot returns the
+// offset of the first End-of-Directory marker (0x00) — a free slot the
+// caller can overwrite. Returns -1 when the root cluster is full.
 //
-// The slot at root entry 0 must currently be either:
-//   - an existing Volume Label entry (0x83 or 0x03) — replaced in place, or
-//   - the End-of-Directory marker (0x00) — replaced and EOD is preserved
-//     at offset 32 since the cluster was zeroed.
+// This scan tolerates the system-file entries (0x81 Bitmap, 0x82 Upcase)
+// that Format emits ahead of any user content: the label entry can live
+// anywhere in the root, not just at offset 0.
+func findLabelSlot(rootBuf []byte) int {
+	for offset := 0; offset+dirEntrySize <= len(rootBuf); offset += dirEntrySize {
+		switch rootBuf[offset] {
+		case exfatEntryVolumeLabel, exfatEntryVolumeLabelUnused:
+			return offset
+		case exfatEntryEnd:
+			return offset
+		}
+	}
+	return -1
+}
+
+// SetLabel writes (or replaces) the Volume Label entry in the root
+// directory. The label is capped at MaxLabelLen UTF-16 code units. An
+// empty label writes a "not-in-use" marker (entry type 0x03) — kernel
+// and Windows treat both as "no label".
 //
-// A non-label, non-EOD entry at offset 0 is rejected: the round assumes
-// the label always lives at the start of the root cluster (the layout
-// produced by Format and by mkfs.exfat).
+// If a Volume Label entry already exists in the root cluster, it is
+// replaced in place. Otherwise the entry is appended at the first
+// End-of-Directory slot.
 func (fs *exfatFS) SetLabel(label string) error {
 	runes := []rune(label)
 	wordCount := 0
@@ -55,17 +71,13 @@ func (fs *exfatFS) SetLabel(label string) error {
 		return fmt.Errorf("exfat: label %q is %d UTF-16 code units, exceeds maximum %d", label, wordCount, MaxLabelLen)
 	}
 
-	// Read current root entry 0.
-	rootOff := fs.info.RootDirOffset(fs.partOffset)
-	current := make([]byte, dirEntrySize)
-	if _, err := fs.f.ReadAt(current, rootOff); err != nil {
-		return fmt.Errorf("exfat SetLabel: read root entry 0: %w", err)
+	rootBuf, err := fs.readDirBuf(fs.info.RootDirectoryCluster)
+	if err != nil {
+		return fmt.Errorf("exfat SetLabel: read root directory: %w", err)
 	}
-	switch current[0] {
-	case exfatEntryVolumeLabel, exfatEntryVolumeLabelUnused, exfatEntryEnd:
-		// OK — safe to replace.
-	default:
-		return fmt.Errorf("exfat SetLabel: root entry 0 has type 0x%02x; label slot must be 0x83 / 0x03 / 0x00", current[0])
+	slot := findLabelSlot(rootBuf)
+	if slot < 0 {
+		return fmt.Errorf("exfat SetLabel: root directory has no slot for a volume label")
 	}
 
 	// Build the new 32-byte Volume Label entry.
@@ -83,32 +95,44 @@ func (fs *exfatFS) SetLabel(label string) error {
 	// bytes 2 + 2*wordCount .. 24 remain zero (pad)
 	// bytes 24 .. 32 remain zero (reserved)
 
-	if _, err := fs.f.WriteAt(entry, rootOff); err != nil {
-		return fmt.Errorf("exfat SetLabel: write root entry 0: %w", err)
+	copy(rootBuf[slot:slot+dirEntrySize], entry)
+	if err := fs.writeDirBuf(fs.info.RootDirectoryCluster, rootBuf); err != nil {
+		return fmt.Errorf("exfat SetLabel: write root directory: %w", err)
 	}
 	fs.label = label
 	return nil
 }
 
-// readVolumeLabel inspects the first directory entry of the root cluster
-// and returns the decoded label string. Returns "" if entry 0 is not a
-// Volume Label entry. Called from Open so the cached fs.label is fresh.
+// readVolumeLabel scans the root directory cluster looking for a Volume
+// Label entry (0x83) and returns the decoded label string. Returns ""
+// (no error) when the root contains no in-use label entry. Called from
+// Open so the cached fs.label is fresh.
+//
+// The scan walks the first cluster only — that is sufficient for both
+// the layout produced by Format() and the layouts produced by mkfs.exfat
+// / newfs_exfat, all of which place the label in the first root cluster.
 func readVolumeLabel(rd diskRW, info Info, partOffset int64) (string, error) {
+	clusterSize := info.ClusterSize()
 	off := info.RootDirOffset(partOffset)
-	buf := make([]byte, dirEntrySize)
+	buf := make([]byte, clusterSize)
 	if _, err := rd.ReadAt(buf, off); err != nil {
-		return "", fmt.Errorf("exfat: read root entry 0: %w", err)
+		return "", fmt.Errorf("exfat: read root directory: %w", err)
 	}
-	if buf[0] != exfatEntryVolumeLabel {
-		return "", nil // not-in-use marker or non-label entry → empty label
+	for offset := 0; offset+dirEntrySize <= len(buf); offset += dirEntrySize {
+		switch buf[offset] {
+		case exfatEntryEnd:
+			return "", nil
+		case exfatEntryVolumeLabel:
+			count := int(buf[offset+1])
+			if count < 0 || count > MaxLabelLen {
+				return "", fmt.Errorf("exfat: Volume Label entry has invalid count %d", count)
+			}
+			words := make([]uint16, count)
+			for i := 0; i < count; i++ {
+				words[i] = binary.LittleEndian.Uint16(buf[offset+2+i*2:])
+			}
+			return string(utf16.Decode(words)), nil
+		}
 	}
-	count := int(buf[1])
-	if count < 0 || count > MaxLabelLen {
-		return "", fmt.Errorf("exfat: Volume Label entry has invalid count %d", count)
-	}
-	words := make([]uint16, count)
-	for i := 0; i < count; i++ {
-		words[i] = binary.LittleEndian.Uint16(buf[2+i*2:])
-	}
-	return string(utf16.Decode(words)), nil
+	return "", nil
 }
