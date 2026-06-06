@@ -1,0 +1,1075 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>exfat: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/go-filesystems/exfat/exfat.go (93.4%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package exfat
+
+import (
+        "encoding/binary"
+        "fmt"
+        "io"
+        "os"
+        "strings"
+        "unicode/utf16"
+
+        filesystem "github.com/go-filesystems/interface"
+)
+
+const (
+        sectorSize        = 512
+        dirEntrySize      = 32
+        exfatEntryEnd     = 0x00
+        exfatEntryFile    = 0x85
+        exfatEntryStream  = 0xC0
+        exfatEntryName    = 0xC1
+        exfatAttrReadOnly = 0x01
+        exfatAttrDir      = 0x10
+        nameCharsPerEntry = 15
+        exfatModeDir      = 0o040755
+        exfatModeDirRO    = 0o040555
+        exfatModeFile     = 0o100644
+        exfatModeFileRO   = 0o100444
+)
+
+type rootDirEntry struct {
+        name    string
+        attr    uint16
+        cluster uint32
+        size    uint64
+}
+
+// Info holds the fields decoded from the exFAT main boot sector.
+type Info struct {
+        PartitionStartSector   uint64
+        VolumeLength           uint64
+        FATOffset              uint32
+        FATLength              uint32
+        ClusterHeapOffset      uint32
+        ClusterCount           uint32
+        RootDirectoryCluster   uint32
+        VolumeSerialNumber     uint32
+        FileSystemRevision     uint16
+        VolumeFlags            uint16
+        BytesPerSectorShift    uint8
+        SectorsPerClusterShift uint8
+        NumberOfFATs           uint8
+        DriveSelect            uint8
+        PercentInUse           uint8
+}
+
+// BytesPerSector returns the logical sector size in bytes.
+func (info Info) BytesPerSector() uint32 <span class="cov8" title="1">{
+        return 1 &lt;&lt; info.BytesPerSectorShift
+}</span>
+
+// SectorsPerCluster returns the cluster size expressed in sectors.
+func (info Info) SectorsPerCluster() uint32 <span class="cov8" title="1">{
+        return 1 &lt;&lt; info.SectorsPerClusterShift
+}</span>
+
+// ClusterSize returns the allocation cluster size in bytes.
+func (info Info) ClusterSize() uint64 <span class="cov8" title="1">{
+        return uint64(info.BytesPerSector()) * uint64(info.SectorsPerCluster())
+}</span>
+
+// FATOffsetBytes returns the absolute byte offset of the first FAT.
+func (info Info) FATOffsetBytes(partOffset int64) int64 <span class="cov8" title="1">{
+        return partOffset + int64(info.FATOffset)*int64(info.BytesPerSector())
+}</span>
+
+// ClusterHeapOffsetBytes returns the absolute byte offset of the cluster heap.
+func (info Info) ClusterHeapOffsetBytes(partOffset int64) int64 <span class="cov8" title="1">{
+        return partOffset + int64(info.ClusterHeapOffset)*int64(info.BytesPerSector())
+}</span>
+
+// RootDirOffset returns the absolute byte offset of the root directory cluster.
+func (info Info) RootDirOffset(partOffset int64) int64 <span class="cov8" title="1">{
+        return info.ClusterHeapOffsetBytes(partOffset) + int64(info.RootDirectoryCluster-2)*int64(info.ClusterSize())
+}</span>
+
+// FS represents an opened exFAT image.
+type FS struct {
+        f          *os.File
+        partOffset int64
+        info       Info
+}
+
+var (
+        openFile            = os.OpenFile
+        openPartitionOffset = partitionOffset
+        openReadInfo        = readInfo
+)
+
+// Verify implementation of the common filesystem interface.
+var _ filesystem.Filesystem = (*FS)(nil)
+
+// Open opens imagePath, optionally selecting a partition, and parses the exFAT boot sector.
+func Open(imagePath string, partIndex int) (*FS, error) <span class="cov8" title="1">{
+        f, err := openFile(imagePath, os.O_RDWR, 0o600)
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, fmt.Errorf("exfat: open %s: %w", imagePath, err)
+        }</span>
+        <span class="cov8" title="1">off, err := openPartitionOffset(f, partIndex)
+        if err != nil </span><span class="cov8" title="1">{
+                f.Close()
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">info, err := openReadInfo(f, off)
+        if err != nil </span><span class="cov8" title="1">{
+                f.Close()
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">return &amp;FS{f: f, partOffset: off, info: info}, nil</span>
+}
+
+// Close releases the underlying file handle.
+func (fs *FS) Close() error <span class="cov8" title="1">{ return fs.f.Close() }</span>
+
+// Info returns the decoded boot-sector metadata.
+func (fs *FS) Info() Info <span class="cov8" title="1">{ return fs.info }</span>
+
+// PartitionOffset returns the byte offset of the selected partition.
+func (fs *FS) PartitionOffset() int64 <span class="cov8" title="1">{ return fs.partOffset }</span>
+
+// Stat returns basic metadata for the root directory or one root entry.
+func (fs *FS) Stat(path string) (filesystem.Stat, error) <span class="cov8" title="1">{
+        if path == "/" </span><span class="cov8" title="1">{
+                return filesystem.NewStat(exfatModeDir, fs.info.ClusterSize(), uint64(fs.info.RootDirectoryCluster)), nil
+        }</span>
+
+        <span class="cov8" title="1">name, err := rootPathName(path, "exfat")
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">entry, err := fs.findRootEntry(path, name)
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">return filesystem.NewStat(entry.mode(), entry.size, uint64(entry.cluster)), nil</span>
+}
+
+// ListDir lists the entries of the root directory. Only "/" is supported.
+func (fs *FS) ListDir(path string) ([]filesystem.DirEntry, error) <span class="cov8" title="1">{
+        if path != "/" </span><span class="cov8" title="1">{
+                return nil, fmt.Errorf("exfat: unsupported path %q", path)
+        }</span>
+        <span class="cov8" title="1">buf, err := fs.readRootDir()
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">return parseRootDirEntries(buf)</span>
+}
+
+// ReadFile reads and returns the contents of the regular file at path.
+// Only root-level paths are supported.
+func (fs *FS) ReadFile(path string) ([]byte, error) <span class="cov8" title="1">{
+        if path == "/" </span><span class="cov8" title="1">{
+                return nil, fmt.Errorf("exfat: %q is not a regular file", path)
+        }</span>
+        <span class="cov8" title="1">name, err := rootPathName(path, "exfat")
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">entry, err := fs.findRootEntry(path, name)
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">if entry.attr&amp;exfatAttrDir != 0 </span><span class="cov8" title="1">{
+                return nil, fmt.Errorf("exfat: %q is not a regular file", path)
+        }</span>
+        <span class="cov8" title="1">return fs.readClusterChain(entry.cluster, entry.size)</span>
+}
+
+// WriteFile creates or overwrites the regular file at path with data and permission bits.
+// Only root-level paths are supported.
+func (fs *FS) WriteFile(path string, data []byte, perm os.FileMode) error <span class="cov8" title="1">{
+        name, err := rootPathName(path, "exfat")
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if name == "" </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q is not a regular file", path)
+        }</span>
+        <span class="cov8" title="1">rootBuf, err := fs.readRootDir()
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">existingOff, existingSec := exfatFindEntry(rootBuf, name)
+        if existingOff &gt;= 0 </span><span class="cov8" title="1">{
+                stream := rootBuf[existingOff+dirEntrySize : existingOff+2*dirEntrySize]
+                oldCluster := binary.LittleEndian.Uint32(stream[20:24])
+                if oldCluster &gt;= 2 </span><span class="cov8" title="1">{
+                        if err := fs.freeChain(oldCluster); err != nil </span><span class="cov0" title="0">{
+                                return err
+                        }</span>
+                }
+                <span class="cov8" title="1">exfatDeleteEntry(rootBuf, existingOff, existingSec)</span>
+        }
+        <span class="cov8" title="1">var firstCluster uint32
+        if len(data) &gt; 0 </span><span class="cov8" title="1">{
+                firstCluster, err = fs.writeData(data)
+                if err != nil </span><span class="cov8" title="1">{
+                        return err
+                }</span>
+        }
+        <span class="cov8" title="1">nameWords := utf16.Encode([]rune(name))
+        numNameEntries := (len(nameWords) + nameCharsPerEntry - 1) / nameCharsPerEntry
+        if numNameEntries == 0 </span><span class="cov0" title="0">{
+                numNameEntries = 1
+        }</span>
+        <span class="cov8" title="1">freeOff := exfatFindFreeSlot(rootBuf, 2+numNameEntries)
+        if freeOff &lt; 0 </span><span class="cov0" title="0">{
+                return fmt.Errorf("exfat: root directory is full")
+        }</span>
+        <span class="cov8" title="1">var attrs uint16 = 0x20 // archive
+        if perm&amp;0o200 == 0 </span><span class="cov8" title="1">{
+                attrs |= uint16(exfatAttrReadOnly)
+        }</span>
+        <span class="cov8" title="1">copy(rootBuf[freeOff:], makeExFATEntrySet(name, attrs, firstCluster, uint64(len(data))))
+        return fs.writeRootDir(rootBuf)</span>
+}
+
+// ReadLink always returns an error; exFAT does not support symbolic links.
+func (fs *FS) ReadLink(path string) (string, error) <span class="cov8" title="1">{
+        return "", fmt.Errorf("exfat: %q is not a symbolic link", path)
+}</span>
+
+// MkDir creates a new empty directory at path.
+// Only root-level directories are supported.
+func (fs *FS) MkDir(path string, perm os.FileMode) error <span class="cov8" title="1">{
+        name, err := rootPathName(path, "exfat")
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if name == "" </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q already exists", path)
+        }</span>
+        <span class="cov8" title="1">rootBuf, err := fs.readRootDir()
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if off, _ := exfatFindEntry(rootBuf, name); off &gt;= 0 </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q already exists", path)
+        }</span>
+        <span class="cov8" title="1">nameWords := utf16.Encode([]rune(name))
+        numNameEntries := (len(nameWords) + nameCharsPerEntry - 1) / nameCharsPerEntry
+        if numNameEntries == 0 </span><span class="cov0" title="0">{
+                numNameEntries = 1
+        }</span>
+        <span class="cov8" title="1">freeOff := exfatFindFreeSlot(rootBuf, 2+numNameEntries)
+        if freeOff &lt; 0 </span><span class="cov0" title="0">{
+                return fmt.Errorf("exfat: root directory is full")
+        }</span>
+        <span class="cov8" title="1">cluster, err := fs.allocCluster()
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if err := fs.setFATEntry(cluster, 0xFFFFFFFF); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+        <span class="cov8" title="1">clusterBuf := make([]byte, fs.info.ClusterSize())
+        clusterOff := fs.info.ClusterHeapOffsetBytes(fs.partOffset) + int64(cluster-2)*int64(fs.info.ClusterSize())
+        if _, err := fs.f.WriteAt(clusterBuf, clusterOff); err != nil </span><span class="cov0" title="0">{
+                return fmt.Errorf("exfat: write directory cluster: %w", err)
+        }</span>
+        <span class="cov8" title="1">var attrs uint16 = uint16(exfatAttrDir)
+        if perm&amp;0o200 == 0 </span><span class="cov8" title="1">{
+                attrs |= uint16(exfatAttrReadOnly)
+        }</span>
+        <span class="cov8" title="1">copy(rootBuf[freeOff:], makeExFATEntrySet(name, attrs, cluster, 0))
+        return fs.writeRootDir(rootBuf)</span>
+}
+
+// DeleteFile removes the regular file at path, freeing its cluster chain.
+func (fs *FS) DeleteFile(path string) error <span class="cov8" title="1">{
+        name, err := rootPathName(path, "exfat")
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if name == "" </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q is not a regular file", path)
+        }</span>
+        <span class="cov8" title="1">rootBuf, err := fs.readRootDir()
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">entryOff, entrySec := exfatFindEntry(rootBuf, name)
+        if entryOff &lt; 0 </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q not found", path)
+        }</span>
+        <span class="cov8" title="1">attrs := binary.LittleEndian.Uint16(rootBuf[entryOff+4 : entryOff+6])
+        if attrs&amp;uint16(exfatAttrDir) != 0 </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q is a directory", path)
+        }</span>
+        <span class="cov8" title="1">stream := rootBuf[entryOff+dirEntrySize : entryOff+2*dirEntrySize]
+        firstCluster := binary.LittleEndian.Uint32(stream[20:24])
+        if firstCluster &gt;= 2 </span><span class="cov8" title="1">{
+                if err := fs.freeChain(firstCluster); err != nil </span><span class="cov0" title="0">{
+                        return err
+                }</span>
+        }
+        <span class="cov8" title="1">exfatDeleteEntry(rootBuf, entryOff, entrySec)
+        return fs.writeRootDir(rootBuf)</span>
+}
+
+// DeleteDir removes the directory at path if it is empty.
+func (fs *FS) DeleteDir(path string) error <span class="cov8" title="1">{
+        name, err := rootPathName(path, "exfat")
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if name == "" </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: cannot delete root directory")
+        }</span>
+        <span class="cov8" title="1">rootBuf, err := fs.readRootDir()
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">entryOff, entrySec := exfatFindEntry(rootBuf, name)
+        if entryOff &lt; 0 </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q not found", path)
+        }</span>
+        <span class="cov8" title="1">attrs := binary.LittleEndian.Uint16(rootBuf[entryOff+4 : entryOff+6])
+        if attrs&amp;uint16(exfatAttrDir) == 0 </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q is not a directory", path)
+        }</span>
+        <span class="cov8" title="1">stream := rootBuf[entryOff+dirEntrySize : entryOff+2*dirEntrySize]
+        firstCluster := binary.LittleEndian.Uint32(stream[20:24])
+        if firstCluster &gt;= 2 </span><span class="cov8" title="1">{
+                dirBuf := make([]byte, fs.info.ClusterSize())
+                dirOff := fs.info.ClusterHeapOffsetBytes(fs.partOffset) + int64(firstCluster-2)*int64(fs.info.ClusterSize())
+                if _, err := fs.f.ReadAt(dirBuf, dirOff); err != nil </span><span class="cov8" title="1">{
+                        return fmt.Errorf("exfat: read directory cluster: %w", err)
+                }</span>
+                <span class="cov8" title="1">for offset := 0; offset+dirEntrySize &lt;= len(dirBuf); </span><span class="cov8" title="1">{
+                        t := dirBuf[offset]
+                        if t == exfatEntryEnd </span><span class="cov8" title="1">{
+                                break</span>
+                        }
+                        <span class="cov8" title="1">if t&amp;0x80 == 0 </span><span class="cov0" title="0">{
+                                offset += dirEntrySize
+                                continue</span>
+                        }
+                        <span class="cov8" title="1">if t == exfatEntryFile </span><span class="cov8" title="1">{
+                                return fmt.Errorf("exfat: %q is not empty", path)
+                        }</span>
+                        <span class="cov0" title="0">offset += dirEntrySize</span>
+                }
+                <span class="cov8" title="1">if err := fs.freeChain(firstCluster); err != nil </span><span class="cov0" title="0">{
+                        return err
+                }</span>
+        }
+        <span class="cov8" title="1">exfatDeleteEntry(rootBuf, entryOff, entrySec)
+        return fs.writeRootDir(rootBuf)</span>
+}
+
+// Rename moves the entry at oldPath to newPath within the root directory.
+// If newPath already exists it is replaced.
+func (fs *FS) Rename(oldPath, newPath string) error <span class="cov8" title="1">{
+        oldName, err := rootPathName(oldPath, "exfat")
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if oldName == "" </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: cannot rename root directory")
+        }</span>
+        <span class="cov8" title="1">newName, err := rootPathName(newPath, "exfat")
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if newName == "" </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: cannot rename to root directory")
+        }</span>
+        <span class="cov8" title="1">if strings.EqualFold(oldName, newName) </span><span class="cov8" title="1">{
+                return nil
+        }</span>
+        <span class="cov8" title="1">rootBuf, err := fs.readRootDir()
+        if err != nil </span><span class="cov8" title="1">{
+                return err
+        }</span>
+        <span class="cov8" title="1">oldOff, oldSec := exfatFindEntry(rootBuf, oldName)
+        if oldOff &lt; 0 </span><span class="cov8" title="1">{
+                return fmt.Errorf("exfat: %q not found", oldPath)
+        }</span>
+        <span class="cov8" title="1">oldAttrs := binary.LittleEndian.Uint16(rootBuf[oldOff+4 : oldOff+6])
+        oldStream := rootBuf[oldOff+dirEntrySize : oldOff+2*dirEntrySize]
+        oldCluster := binary.LittleEndian.Uint32(oldStream[20:24])
+        oldSize := binary.LittleEndian.Uint64(oldStream[24:32])
+
+        newOff, newSec := exfatFindEntry(rootBuf, newName)
+        if newOff &gt;= 0 </span><span class="cov8" title="1">{
+                newStream := rootBuf[newOff+dirEntrySize : newOff+2*dirEntrySize]
+                newCluster := binary.LittleEndian.Uint32(newStream[20:24])
+                if newCluster &gt;= 2 </span><span class="cov8" title="1">{
+                        if err := fs.freeChain(newCluster); err != nil </span><span class="cov0" title="0">{
+                                return err
+                        }</span>
+                }
+                <span class="cov8" title="1">exfatDeleteEntry(rootBuf, newOff, newSec)</span>
+        }
+        <span class="cov8" title="1">exfatDeleteEntry(rootBuf, oldOff, oldSec)
+
+        nameWords := utf16.Encode([]rune(newName))
+        numNameEntries := (len(nameWords) + nameCharsPerEntry - 1) / nameCharsPerEntry
+        if numNameEntries == 0 </span><span class="cov0" title="0">{
+                numNameEntries = 1
+        }</span>
+        <span class="cov8" title="1">freeOff := exfatFindFreeSlot(rootBuf, 2+numNameEntries)
+        if freeOff &lt; 0 </span><span class="cov0" title="0">{
+                return fmt.Errorf("exfat: root directory is full")
+        }</span>
+        <span class="cov8" title="1">copy(rootBuf[freeOff:], makeExFATEntrySet(newName, oldAttrs, oldCluster, oldSize))
+        return fs.writeRootDir(rootBuf)</span>
+}
+
+func readInfo(r io.ReaderAt, partOffset int64) (Info, error) <span class="cov8" title="1">{
+        buf := make([]byte, sectorSize)
+        if _, err := r.ReadAt(buf, partOffset); err != nil </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: read boot sector: %w", err)
+        }</span>
+        <span class="cov8" title="1">if buf[510] != 0x55 || buf[511] != 0xAA </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: invalid boot sector signature")
+        }</span>
+        <span class="cov8" title="1">if string(buf[3:11]) != "EXFAT   " </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: invalid filesystem name %q", string(buf[3:11]))
+        }</span>
+
+        <span class="cov8" title="1">le := binary.LittleEndian
+        volumeLength := le.Uint64(buf[72:])
+        if volumeLength == 0 </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: volume length is zero")
+        }</span>
+        <span class="cov8" title="1">fatOffset := le.Uint32(buf[80:])
+        if fatOffset == 0 </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: FAT offset is zero")
+        }</span>
+        <span class="cov8" title="1">fatLength := le.Uint32(buf[84:])
+        if fatLength == 0 </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: FAT length is zero")
+        }</span>
+        <span class="cov8" title="1">clusterHeapOffset := le.Uint32(buf[88:])
+        if clusterHeapOffset == 0 </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: cluster heap offset is zero")
+        }</span>
+        <span class="cov8" title="1">clusterCount := le.Uint32(buf[92:])
+        if clusterCount == 0 </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: cluster count is zero")
+        }</span>
+        <span class="cov8" title="1">rootDirectoryCluster := le.Uint32(buf[96:])
+        if rootDirectoryCluster &lt; 2 || rootDirectoryCluster &gt; clusterCount+1 </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: invalid root directory cluster %d", rootDirectoryCluster)
+        }</span>
+        <span class="cov8" title="1">bytesPerSectorShift := buf[108]
+        if bytesPerSectorShift &lt; 9 || bytesPerSectorShift &gt; 12 </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: invalid bytes-per-sector shift %d", bytesPerSectorShift)
+        }</span>
+        <span class="cov8" title="1">sectorsPerClusterShift := buf[109]
+        if sectorsPerClusterShift &gt; 25-bytesPerSectorShift </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: invalid sectors-per-cluster shift %d", sectorsPerClusterShift)
+        }</span>
+        <span class="cov8" title="1">numberOfFATs := buf[110]
+        if numberOfFATs == 0 </span><span class="cov8" title="1">{
+                return Info{}, fmt.Errorf("exfat: FAT count is zero")
+        }</span>
+
+        <span class="cov8" title="1">return Info{
+                PartitionStartSector:   le.Uint64(buf[64:]),
+                VolumeLength:           volumeLength,
+                FATOffset:              fatOffset,
+                FATLength:              fatLength,
+                ClusterHeapOffset:      clusterHeapOffset,
+                ClusterCount:           clusterCount,
+                RootDirectoryCluster:   rootDirectoryCluster,
+                VolumeSerialNumber:     le.Uint32(buf[100:]),
+                FileSystemRevision:     le.Uint16(buf[104:]),
+                VolumeFlags:            le.Uint16(buf[106:]),
+                BytesPerSectorShift:    bytesPerSectorShift,
+                SectorsPerClusterShift: sectorsPerClusterShift,
+                NumberOfFATs:           numberOfFATs,
+                DriveSelect:            buf[111],
+                PercentInUse:           buf[112],
+        }, nil</span>
+}
+
+func partitionOffset(r io.ReaderAt, partIndex int) (int64, error) <span class="cov8" title="1">{
+        var sig [8]byte
+        if _, err := r.ReadAt(sig[:], sectorSize); err == nil &amp;&amp; string(sig[:]) == "EFI PART" </span><span class="cov8" title="1">{
+                return gptPartOffset(r, partIndex)
+        }</span>
+
+        <span class="cov8" title="1">var magic [2]byte
+        if _, err := r.ReadAt(magic[:], 510); err == nil &amp;&amp; magic[0] == 0x55 &amp;&amp; magic[1] == 0xAA </span><span class="cov8" title="1">{
+                return mbrPartOffset(r, partIndex)
+        }</span>
+
+        <span class="cov8" title="1">return 0, nil</span>
+}
+
+func gptPartOffset(r io.ReaderAt, partIndex int) (int64, error) <span class="cov8" title="1">{
+        hdr := make([]byte, 92)
+        if _, err := r.ReadAt(hdr, sectorSize); err != nil </span><span class="cov8" title="1">{
+                return 0, fmt.Errorf("exfat: read GPT header: %w", err)
+        }</span>
+        <span class="cov8" title="1">le := binary.LittleEndian
+        partEntryLBA := le.Uint64(hdr[72:])
+        numParts := le.Uint32(hdr[80:])
+        entrySize := le.Uint32(hdr[84:])
+        if entrySize &lt; 128 </span><span class="cov8" title="1">{
+                return 0, fmt.Errorf("exfat: unexpected GPT entry size %d", entrySize)
+        }</span>
+
+        <span class="cov8" title="1">tableOff := int64(partEntryLBA) * sectorSize
+        buf := make([]byte, entrySize)
+        for index := uint32(0); index &lt; numParts; index++ </span><span class="cov8" title="1">{
+                if _, err := r.ReadAt(buf, tableOff+int64(index)*int64(entrySize)); err != nil </span><span class="cov8" title="1">{
+                        break</span>
+                }
+                <span class="cov8" title="1">var typeGUID [16]byte
+                copy(typeGUID[:], buf[:16])
+                startLBA := le.Uint64(buf[32:])
+
+                if partIndex &gt;= 0 </span><span class="cov8" title="1">{
+                        if int(index) != partIndex </span><span class="cov8" title="1">{
+                                continue</span>
+                        }
+                        <span class="cov8" title="1">if typeGUID == [16]byte{} || startLBA == 0 </span><span class="cov8" title="1">{
+                                return 0, fmt.Errorf("exfat: GPT partition index %d not found", partIndex)
+                        }</span>
+                        <span class="cov8" title="1">return int64(startLBA) * sectorSize, nil</span>
+                }
+
+                <span class="cov8" title="1">if typeGUID != [16]byte{} &amp;&amp; startLBA != 0 </span><span class="cov8" title="1">{
+                        return int64(startLBA) * sectorSize, nil
+                }</span>
+        }
+
+        <span class="cov8" title="1">if partIndex &gt;= 0 </span><span class="cov8" title="1">{
+                return 0, fmt.Errorf("exfat: GPT partition index %d not found", partIndex)
+        }</span>
+        <span class="cov8" title="1">return 0, fmt.Errorf("exfat: no populated GPT partition found")</span>
+}
+
+func mbrPartOffset(r io.ReaderAt, partIndex int) (int64, error) <span class="cov8" title="1">{
+        table := make([]byte, 64)
+        if _, err := r.ReadAt(table, 446); err != nil </span><span class="cov8" title="1">{
+                return 0, fmt.Errorf("exfat: read MBR partition table: %w", err)
+        }</span>
+        <span class="cov8" title="1">for index := 0; index &lt; 4; index++ </span><span class="cov8" title="1">{
+                entry := table[index*16:]
+                startLBA := binary.LittleEndian.Uint32(entry[8:])
+
+                if partIndex &gt;= 0 </span><span class="cov8" title="1">{
+                        if index != partIndex </span><span class="cov8" title="1">{
+                                continue</span>
+                        }
+                        <span class="cov8" title="1">if startLBA == 0 </span><span class="cov8" title="1">{
+                                return 0, fmt.Errorf("exfat: MBR partition index %d not found", partIndex)
+                        }</span>
+                        <span class="cov8" title="1">return int64(startLBA) * sectorSize, nil</span>
+                }
+
+                <span class="cov8" title="1">if startLBA != 0 </span><span class="cov8" title="1">{
+                        return int64(startLBA) * sectorSize, nil
+                }</span>
+        }
+
+        <span class="cov8" title="1">if partIndex &gt;= 0 </span><span class="cov8" title="1">{
+                return 0, fmt.Errorf("exfat: MBR partition index %d not found", partIndex)
+        }</span>
+        <span class="cov8" title="1">return 0, nil</span>
+}
+
+func (fs *FS) readRootDir() ([]byte, error) <span class="cov8" title="1">{
+        buf := make([]byte, fs.info.ClusterSize())
+        if _, err := fs.f.ReadAt(buf, fs.info.RootDirOffset(fs.partOffset)); err != nil </span><span class="cov8" title="1">{
+                return nil, fmt.Errorf("exfat: read root directory: %w", err)
+        }</span>
+        <span class="cov8" title="1">return buf, nil</span>
+}
+
+func (fs *FS) findRootEntry(path string, name string) (rootDirEntry, error) <span class="cov8" title="1">{
+        buf, err := fs.readRootDir()
+        if err != nil </span><span class="cov8" title="1">{
+                return rootDirEntry{}, err
+        }</span>
+        <span class="cov8" title="1">entries, err := parseRootDirMetadata(buf)
+        if err != nil </span><span class="cov8" title="1">{
+                return rootDirEntry{}, err
+        }</span>
+        <span class="cov8" title="1">for _, entry := range entries </span><span class="cov8" title="1">{
+                if strings.EqualFold(entry.name, name) </span><span class="cov8" title="1">{
+                        return entry, nil
+                }</span>
+        }
+        <span class="cov8" title="1">return rootDirEntry{}, fmt.Errorf("exfat: %q not found", path)</span>
+}
+
+func parseRootDirEntries(buf []byte) ([]filesystem.DirEntry, error) <span class="cov8" title="1">{
+        metadata, err := parseRootDirMetadata(buf)
+        if err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">entries := make([]filesystem.DirEntry, 0, len(metadata))
+        for _, entry := range metadata </span><span class="cov8" title="1">{
+                entries = append(entries, filesystem.NewDirEntry(uint64(entry.cluster), entry.name, uint8(entry.attr)))
+        }</span>
+        <span class="cov8" title="1">return entries, nil</span>
+}
+
+func parseRootDirMetadata(buf []byte) ([]rootDirEntry, error) <span class="cov8" title="1">{
+        entries := make([]rootDirEntry, 0)
+        le := binary.LittleEndian
+        for offset := 0; offset+dirEntrySize &lt;= len(buf); offset += dirEntrySize </span><span class="cov8" title="1">{
+                entry := buf[offset : offset+dirEntrySize]
+                typ := entry[0]
+                if typ == exfatEntryEnd </span><span class="cov8" title="1">{
+                        return entries, nil
+                }</span>
+                <span class="cov8" title="1">if typ != exfatEntryFile </span><span class="cov8" title="1">{
+                        continue</span>
+                }
+                <span class="cov8" title="1">secondaryCount := int(entry[1])
+                if secondaryCount &lt; 2 || offset+(secondaryCount+1)*dirEntrySize &gt; len(buf) </span><span class="cov8" title="1">{
+                        return nil, fmt.Errorf("exfat: truncated file entry set")
+                }</span>
+                <span class="cov8" title="1">stream := buf[offset+dirEntrySize : offset+2*dirEntrySize]
+                if stream[0] != exfatEntryStream </span><span class="cov8" title="1">{
+                        return nil, fmt.Errorf("exfat: file entry missing stream extension")
+                }</span>
+                <span class="cov8" title="1">nameLen := int(stream[3])
+                nameWords := make([]uint16, 0, secondaryCount*nameCharsPerEntry)
+                for index := 2; index &lt;= secondaryCount; index++ </span><span class="cov8" title="1">{
+                        nameEntry := buf[offset+index*dirEntrySize : offset+(index+1)*dirEntrySize]
+                        if nameEntry[0] != exfatEntryName </span><span class="cov8" title="1">{
+                                return nil, fmt.Errorf("exfat: file entry missing filename entry")
+                        }</span>
+                        <span class="cov8" title="1">for charOffset := 2; charOffset &lt; dirEntrySize; charOffset += 2 </span><span class="cov8" title="1">{
+                                nameWords = append(nameWords, le.Uint16(nameEntry[charOffset:charOffset+2]))
+                        }</span>
+                }
+                <span class="cov8" title="1">if nameLen &gt; len(nameWords) </span><span class="cov8" title="1">{
+                        return nil, fmt.Errorf("exfat: filename length exceeds entry set")
+                }</span>
+                <span class="cov8" title="1">attrs := le.Uint16(entry[4:6])
+                firstCluster := le.Uint32(stream[20:24])
+                dataLength := le.Uint64(stream[24:32])
+                name := string(utf16.Decode(nameWords[:nameLen]))
+                entries = append(entries, rootDirEntry{name: name, attr: attrs, cluster: firstCluster, size: dataLength})
+                offset += secondaryCount * dirEntrySize</span>
+        }
+        <span class="cov8" title="1">return entries, nil</span>
+}
+
+func (entry rootDirEntry) mode() uint16 <span class="cov8" title="1">{
+        if entry.attr&amp;exfatAttrDir != 0 </span><span class="cov8" title="1">{
+                if entry.attr&amp;exfatAttrReadOnly != 0 </span><span class="cov8" title="1">{
+                        return exfatModeDirRO
+                }</span>
+                <span class="cov8" title="1">return exfatModeDir</span>
+        }
+        <span class="cov8" title="1">if entry.attr&amp;exfatAttrReadOnly != 0 </span><span class="cov8" title="1">{
+                return exfatModeFileRO
+        }</span>
+        <span class="cov8" title="1">return exfatModeFile</span>
+}
+
+func rootPathName(path string, prefix string) (string, error) <span class="cov8" title="1">{
+        if !strings.HasPrefix(path, "/") </span><span class="cov8" title="1">{
+                return "", fmt.Errorf("%s: unsupported path %q", prefix, path)
+        }</span>
+        <span class="cov8" title="1">name := strings.TrimPrefix(path, "/")
+        if name == "" </span><span class="cov8" title="1">{
+                return "", nil
+        }</span>
+        <span class="cov8" title="1">if strings.Contains(name, "/") </span><span class="cov8" title="1">{
+                return "", fmt.Errorf("%s: nested paths are not supported %q", prefix, path)
+        }</span>
+        <span class="cov8" title="1">return name, nil</span>
+}
+
+// readClusterChain follows the FAT chain starting at start and returns up to size bytes.
+func (fs *FS) readClusterChain(start uint32, size uint64) ([]byte, error) <span class="cov8" title="1">{
+        if start == 0 </span><span class="cov8" title="1">{
+                return []byte{}, nil
+        }</span>
+        <span class="cov8" title="1">clusterSize := int64(fs.info.ClusterSize())
+        fatBase := fs.info.FATOffsetBytes(fs.partOffset)
+        dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
+        buf := make([]byte, 0, size)
+        cluster := start
+        for </span><span class="cov8" title="1">{
+                if cluster &lt; 2 || cluster &gt;= 0xFFFFFFF7 </span><span class="cov0" title="0">{
+                        break</span>
+                }
+                <span class="cov8" title="1">clusterBuf := make([]byte, clusterSize)
+                off := dataBase + int64(cluster-2)*clusterSize
+                if _, err := fs.f.ReadAt(clusterBuf, off); err != nil </span><span class="cov8" title="1">{
+                        return nil, fmt.Errorf("exfat: read cluster %d: %w", cluster, err)
+                }</span>
+                <span class="cov8" title="1">buf = append(buf, clusterBuf...)
+                var nextEntry [4]byte
+                if _, err := fs.f.ReadAt(nextEntry[:], fatBase+int64(cluster)*4); err != nil </span><span class="cov0" title="0">{
+                        return nil, fmt.Errorf("exfat: read FAT entry for cluster %d: %w", cluster, err)
+                }</span>
+                <span class="cov8" title="1">next := binary.LittleEndian.Uint32(nextEntry[:])
+                if next &gt;= 0xFFFFFFF8 </span><span class="cov8" title="1">{
+                        break</span>
+                }
+                <span class="cov8" title="1">cluster = next</span>
+        }
+        <span class="cov8" title="1">if uint64(len(buf)) &gt; size </span><span class="cov8" title="1">{
+                buf = buf[:size]
+        }</span>
+        <span class="cov8" title="1">return buf, nil</span>
+}
+
+// writeData allocates FAT clusters, writes data into them, and returns the first cluster.
+func (fs *FS) writeData(data []byte) (uint32, error) <span class="cov8" title="1">{
+        clusterSize := int64(fs.info.ClusterSize())
+        numClusters := (int64(len(data)) + clusterSize - 1) / clusterSize
+        allocated := make([]uint32, numClusters)
+        for i := range allocated </span><span class="cov8" title="1">{
+                c, err := fs.allocCluster()
+                if err != nil </span><span class="cov8" title="1">{
+                        for _, ac := range allocated[:i] </span><span class="cov0" title="0">{
+                                _ = fs.setFATEntry(ac, 0)
+                        }</span>
+                        <span class="cov8" title="1">return 0, err</span>
+                }
+                <span class="cov8" title="1">if err := fs.setFATEntry(c, 0xFFFFFFFF); err != nil </span><span class="cov0" title="0">{
+                        return 0, err
+                }</span>
+                <span class="cov8" title="1">allocated[i] = c</span>
+        }
+        <span class="cov8" title="1">for i := 0; i &lt; len(allocated)-1; i++ </span><span class="cov8" title="1">{
+                if err := fs.setFATEntry(allocated[i], allocated[i+1]); err != nil </span><span class="cov0" title="0">{
+                        return 0, err
+                }</span>
+        }
+        <span class="cov8" title="1">dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
+        for i, c := range allocated </span><span class="cov8" title="1">{
+                off := dataBase + int64(c-2)*clusterSize
+                start := int64(i) * clusterSize
+                end := start + clusterSize
+                if end &gt; int64(len(data)) </span><span class="cov8" title="1">{
+                        clusterBuf := make([]byte, clusterSize)
+                        copy(clusterBuf, data[start:])
+                        if _, err := fs.f.WriteAt(clusterBuf, off); err != nil </span><span class="cov0" title="0">{
+                                return 0, fmt.Errorf("exfat: write cluster %d: %w", c, err)
+                        }</span>
+                } else<span class="cov8" title="1"> {
+                        if _, err := fs.f.WriteAt(data[start:end], off); err != nil </span><span class="cov0" title="0">{
+                                return 0, fmt.Errorf("exfat: write cluster %d: %w", c, err)
+                        }</span>
+                }
+        }
+        <span class="cov8" title="1">return allocated[0], nil</span>
+}
+
+// allocCluster scans the FAT and returns the first free cluster number (≥ 2).
+func (fs *FS) allocCluster() (uint32, error) <span class="cov8" title="1">{
+        fatBase := fs.info.FATOffsetBytes(fs.partOffset)
+        var buf [4]byte
+        for c := uint32(2); c &lt; fs.info.ClusterCount+2; c++ </span><span class="cov8" title="1">{
+                if _, err := fs.f.ReadAt(buf[:], fatBase+int64(c)*4); err != nil </span><span class="cov0" title="0">{
+                        return 0, fmt.Errorf("exfat: read FAT entry: %w", err)
+                }</span>
+                <span class="cov8" title="1">if binary.LittleEndian.Uint32(buf[:]) == 0 </span><span class="cov8" title="1">{
+                        return c, nil
+                }</span>
+        }
+        <span class="cov8" title="1">return 0, fmt.Errorf("exfat: no free clusters")</span>
+}
+
+// setFATEntry writes a 32-bit FAT entry for cluster.
+func (fs *FS) setFATEntry(cluster uint32, value uint32) error <span class="cov8" title="1">{
+        fatBase := fs.info.FATOffsetBytes(fs.partOffset)
+        off := fatBase + int64(cluster)*4
+        var buf [4]byte
+        binary.LittleEndian.PutUint32(buf[:], value)
+        if _, err := fs.f.WriteAt(buf[:], off); err != nil </span><span class="cov0" title="0">{
+                return fmt.Errorf("exfat: write FAT entry for cluster %d: %w", cluster, err)
+        }</span>
+        <span class="cov8" title="1">return nil</span>
+}
+
+// freeChain marks every cluster in the FAT chain starting at start as free.
+func (fs *FS) freeChain(start uint32) error <span class="cov8" title="1">{
+        fatBase := fs.info.FATOffsetBytes(fs.partOffset)
+        cluster := start
+        for cluster &gt;= 2 &amp;&amp; cluster &lt; 0xFFFFFFF7 </span><span class="cov8" title="1">{
+                var next [4]byte
+                if _, err := fs.f.ReadAt(next[:], fatBase+int64(cluster)*4); err != nil </span><span class="cov0" title="0">{
+                        return fmt.Errorf("exfat: read FAT entry for cluster %d: %w", cluster, err)
+                }</span>
+                <span class="cov8" title="1">nextCluster := binary.LittleEndian.Uint32(next[:])
+                if err := fs.setFATEntry(cluster, 0); err != nil </span><span class="cov0" title="0">{
+                        return err
+                }</span>
+                <span class="cov8" title="1">if nextCluster &gt;= 0xFFFFFFF8 </span><span class="cov8" title="1">{
+                        break</span>
+                }
+                <span class="cov8" title="1">cluster = nextCluster</span>
+        }
+        <span class="cov8" title="1">return nil</span>
+}
+
+// writeRootDir writes the root directory cluster buffer back to disk.
+func (fs *FS) writeRootDir(buf []byte) error <span class="cov8" title="1">{
+        if _, err := fs.f.WriteAt(buf, fs.info.RootDirOffset(fs.partOffset)); err != nil </span><span class="cov0" title="0">{
+                return fmt.Errorf("exfat: write root directory: %w", err)
+        }</span>
+        <span class="cov8" title="1">return nil</span>
+}
+
+// makeExFATEntrySet creates a checksummed exFAT directory entry set.
+func makeExFATEntrySet(name string, attrs uint16, cluster uint32, size uint64) []byte <span class="cov8" title="1">{
+        nameWords := utf16.Encode([]rune(name))
+        numNameEntries := (len(nameWords) + nameCharsPerEntry - 1) / nameCharsPerEntry
+        if numNameEntries == 0 </span><span class="cov0" title="0">{
+                numNameEntries = 1
+        }</span>
+        <span class="cov8" title="1">secondaryCount := uint8(1 + numNameEntries)
+        buf := make([]byte, int(1+secondaryCount)*dirEntrySize)
+        le := binary.LittleEndian
+
+        buf[0] = exfatEntryFile
+        buf[1] = secondaryCount
+        le.PutUint16(buf[4:6], attrs)
+
+        s := buf[dirEntrySize:]
+        s[0] = exfatEntryStream
+        s[1] = 1 // allocationPossible
+        s[3] = uint8(len(nameWords))
+        le.PutUint16(s[4:6], exfatNameHash(name))
+        le.PutUint64(s[8:16], size)
+        le.PutUint32(s[20:24], cluster)
+        le.PutUint64(s[24:32], size)
+
+        for i := 0; i &lt; numNameEntries; i++ </span><span class="cov8" title="1">{
+                n := buf[(2+i)*dirEntrySize:]
+                n[0] = exfatEntryName
+                start := i * nameCharsPerEntry
+                end := start + nameCharsPerEntry
+                if end &gt; len(nameWords) </span><span class="cov8" title="1">{
+                        end = len(nameWords)
+                }</span>
+                <span class="cov8" title="1">for j, w := range nameWords[start:end] </span><span class="cov8" title="1">{
+                        le.PutUint16(n[2+j*2:], w)
+                }</span>
+        }
+
+        <span class="cov8" title="1">le.PutUint16(buf[2:4], exfatEntrySetChecksum(buf))
+        return buf</span>
+}
+
+// exfatNameHash computes the exFAT name hash for an uppercase UTF-16LE name.
+func exfatNameHash(name string) uint16 <span class="cov8" title="1">{
+        var hash uint16
+        for _, w := range utf16.Encode([]rune(strings.ToUpper(name))) </span><span class="cov8" title="1">{
+                hash = (hash &gt;&gt; 1) | (hash &lt;&lt; 15)
+                hash += uint16(w &amp; 0xFF)
+                hash = (hash &gt;&gt; 1) | (hash &lt;&lt; 15)
+                hash += uint16(w &gt;&gt; 8)
+        }</span>
+        <span class="cov8" title="1">return hash</span>
+}
+
+// exfatEntrySetChecksum computes the checksum over all entries in an entry set.
+func exfatEntrySetChecksum(entries []byte) uint16 <span class="cov8" title="1">{
+        var checksum uint16
+        n := len(entries) / dirEntrySize
+        for i := 0; i &lt; n; i++ </span><span class="cov8" title="1">{
+                for j := 0; j &lt; dirEntrySize; j++ </span><span class="cov8" title="1">{
+                        if i == 0 &amp;&amp; (j == 2 || j == 3) </span><span class="cov8" title="1">{
+                                continue</span>
+                        }
+                        <span class="cov8" title="1">checksum = (checksum &gt;&gt; 1) | (checksum &lt;&lt; 15)
+                        checksum += uint16(entries[i*dirEntrySize+j])</span>
+                }
+        }
+        <span class="cov8" title="1">return checksum</span>
+}
+
+// exfatFindEntry searches for an in-use file entry with the given name (case-insensitive).
+// Returns (offset, secondaryCount) if found, (-1, 0) otherwise.
+func exfatFindEntry(buf []byte, name string) (int, int) <span class="cov8" title="1">{
+        le := binary.LittleEndian
+        for offset := 0; offset+dirEntrySize &lt;= len(buf); </span><span class="cov8" title="1">{
+                typ := buf[offset]
+                if typ == exfatEntryEnd </span><span class="cov8" title="1">{
+                        break</span>
+                }
+                <span class="cov8" title="1">if typ&amp;0x80 == 0 </span><span class="cov8" title="1">{
+                        offset += dirEntrySize
+                        continue</span>
+                }
+                <span class="cov8" title="1">if typ != exfatEntryFile </span><span class="cov0" title="0">{
+                        offset += dirEntrySize
+                        continue</span>
+                }
+                <span class="cov8" title="1">secondaryCount := int(buf[offset+1])
+                if offset+(secondaryCount+1)*dirEntrySize &gt; len(buf) </span><span class="cov0" title="0">{
+                        break</span>
+                }
+                <span class="cov8" title="1">stream := buf[offset+dirEntrySize : offset+2*dirEntrySize]
+                nameLen := int(stream[3])
+                nameWords := make([]uint16, 0, nameLen)
+                for i := 2; i &lt;= secondaryCount; i++ </span><span class="cov8" title="1">{
+                        ne := buf[offset+i*dirEntrySize : offset+(i+1)*dirEntrySize]
+                        if ne[0] != exfatEntryName </span><span class="cov0" title="0">{
+                                break</span>
+                        }
+                        <span class="cov8" title="1">for j := 2; j &lt; dirEntrySize; j += 2 </span><span class="cov8" title="1">{
+                                nameWords = append(nameWords, le.Uint16(ne[j:j+2]))
+                        }</span>
+                }
+                <span class="cov8" title="1">if len(nameWords) &gt;= nameLen </span><span class="cov8" title="1">{
+                        entryName := string(utf16.Decode(nameWords[:nameLen]))
+                        if strings.EqualFold(entryName, name) </span><span class="cov8" title="1">{
+                                return offset, secondaryCount
+                        }</span>
+                }
+                <span class="cov8" title="1">offset += (secondaryCount + 1) * dirEntrySize</span>
+        }
+        <span class="cov8" title="1">return -1, 0</span>
+}
+
+// exfatFindFreeSlot returns the offset of the first position with at least setSize
+// consecutive free (0x00) entries. Returns -1 if no slot is available.
+func exfatFindFreeSlot(buf []byte, setSize int) int <span class="cov8" title="1">{
+        for offset := 0; offset+dirEntrySize &lt;= len(buf); </span><span class="cov8" title="1">{
+                typ := buf[offset]
+                if typ == exfatEntryEnd </span><span class="cov8" title="1">{
+                        remaining := (len(buf) - offset) / dirEntrySize
+                        if remaining &gt;= setSize </span><span class="cov8" title="1">{
+                                return offset
+                        }</span>
+                        <span class="cov0" title="0">return -1</span>
+                }
+                <span class="cov8" title="1">if typ&amp;0x80 == 0 </span><span class="cov8" title="1">{
+                        offset += dirEntrySize
+                        continue</span>
+                }
+                <span class="cov8" title="1">if typ == exfatEntryFile </span><span class="cov8" title="1">{
+                        secondaryCount := int(buf[offset+1])
+                        if offset+(secondaryCount+1)*dirEntrySize &gt; len(buf) </span><span class="cov0" title="0">{
+                                return -1
+                        }</span>
+                        <span class="cov8" title="1">offset += (secondaryCount + 1) * dirEntrySize</span>
+                } else<span class="cov0" title="0"> {
+                        offset += dirEntrySize
+                }</span>
+        }
+        <span class="cov0" title="0">return -1</span>
+}
+
+// exfatDeleteEntry marks the entry set beginning at offset as deleted.
+func exfatDeleteEntry(buf []byte, offset int, secondaryCount int) <span class="cov8" title="1">{
+        for i := 0; i &lt;= secondaryCount; i++ </span><span class="cov8" title="1">{
+                off := offset + i*dirEntrySize
+                if off+dirEntrySize &lt;= len(buf) </span><span class="cov8" title="1">{
+                        buf[off] &amp;^= 0x80
+                }</span>
+        }
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>
