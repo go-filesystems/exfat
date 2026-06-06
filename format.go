@@ -33,15 +33,19 @@ type FormatConfig struct {
 // 0x81 and 0x82 entries respectively); Apple's fsck_exfat refuses to verify
 // a volume that's missing either of them.
 const (
-	fmtBytesPerSectorShift    = 9  // 512-byte sectors
-	fmtSectorsPerClusterShift = 3  // 8 sectors/cluster → 4 KiB clusters
-	fmtFATOffset              = 24 // sectors from partition start (12 KiB)
-	fmtFATLength              = 8  // sectors for FAT (covers up to ~8 K clusters)
-	fmtClusterHeapOffset      = 32 // sectors from partition start (16 KiB)
+	fmtBytesPerSectorShift    = 9 // 512-byte sectors
+	fmtSectorsPerClusterShift = 3 // 8 sectors/cluster → 4 KiB clusters
+	fmtFATOffset              = 24
 	fmtNumberOfFATs           = 1
 	fmtBitmapCluster          = 2
 	fmtUpcaseCluster          = 3
 	fmtRootDirCluster         = 4
+
+	// fmtFATGrowthHeadroom controls how much spare FAT space Format
+	// provisions so that subsequent Grow calls don't immediately hit
+	// the FAT-capacity ceiling. The FAT is sized to cover the max
+	// addressable cluster count for fmtFATGrowthHeadroom × sizeBytes.
+	fmtFATGrowthHeadroom = 4
 )
 
 type formatFile interface {
@@ -78,7 +82,31 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	}
 
 	totalSectors := uint64(sizeBytes) / bytesPerSector
-	clusterCount := uint32((totalSectors - fmtClusterHeapOffset) / sectorsPerCluster)
+
+	// Provision a FAT generous enough to accommodate Grow up to
+	// fmtFATGrowthHeadroom × sizeBytes without relocating the cluster
+	// heap. The minimum FAT length covers the max addressable cluster
+	// count for the headroom size; we round up to a whole cluster so
+	// the heap offset stays cluster-aligned.
+	headroomSectors := totalSectors * fmtFATGrowthHeadroom
+	maxClustersForHeadroom := (headroomSectors - fmtFATOffset) / sectorsPerCluster
+	fatBytes := (maxClustersForHeadroom + 2) * 4
+	fatLength := uint64((fatBytes + bytesPerSector - 1) / bytesPerSector)
+	if fatLength < 8 {
+		fatLength = 8
+	}
+	// Round the cluster heap offset up to a cluster boundary past the
+	// FAT. This keeps cluster reads aligned, which Apple's fsck_exfat
+	// requires.
+	clusterHeapOffset := uint64(fmtFATOffset) + fatLength
+	if rem := clusterHeapOffset % sectorsPerCluster; rem != 0 {
+		clusterHeapOffset += sectorsPerCluster - rem
+	}
+
+	if totalSectors <= clusterHeapOffset {
+		return nil, fmt.Errorf("exfat: format: size %d too small", sizeBytes)
+	}
+	clusterCount := uint32((totalSectors - clusterHeapOffset) / sectorsPerCluster)
 	if clusterCount < 1 {
 		return nil, fmt.Errorf("exfat: format: size %d too small", sizeBytes)
 	}
@@ -91,7 +119,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	// dataClusterOffset returns the absolute byte offset of the start of
 	// cluster c within the cluster heap. Cluster indices are 2-based.
 	dataClusterOffset := func(c uint32) int64 {
-		return int64(fmtClusterHeapOffset)*bytesPerSector + int64(c-2)*clusterSize
+		return int64(clusterHeapOffset)*bytesPerSector + int64(c-2)*clusterSize
 	}
 
 	serialNumber := cfg.VolumeSerialNumber
@@ -144,8 +172,8 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	// PartitionStartSector = 0
 	le.PutUint64(boot[72:], totalSectors)
 	le.PutUint32(boot[80:], fmtFATOffset)
-	le.PutUint32(boot[84:], fmtFATLength)
-	le.PutUint32(boot[88:], fmtClusterHeapOffset)
+	le.PutUint32(boot[84:], uint32(fatLength))
+	le.PutUint32(boot[88:], uint32(clusterHeapOffset))
 	le.PutUint32(boot[92:], clusterCount)
 	le.PutUint32(boot[96:], fmtRootDirCluster)
 	le.PutUint32(boot[100:], serialNumber)
