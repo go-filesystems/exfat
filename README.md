@@ -10,6 +10,7 @@ Supports bare filesystem images and MBR/GPT partitioned disks, full directory tr
 |---|---:|---|
 | Open / Close | ✅ | Supports bare images and partitioned disks |
 | Format | ✅ | Creates exFAT images |
+| Resize / Grow | ✅ | `Grow` and `Resize` implemented |
 | ReadFile | ✅ | Full file reads supported |
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
