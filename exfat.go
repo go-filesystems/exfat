@@ -306,7 +306,9 @@ func (fs *exfatFS) MkDir(path string, perm os.FileMode) error {
 	if perm&0o200 == 0 {
 		attrs |= uint16(exfatAttrReadOnly)
 	}
-	copy(rootBuf[freeOff:], makeExFATEntrySet(name, attrs, cluster, 0))
+	// A directory's data length must equal its allocated size (one cluster
+	// here), not 0 — fsck.exfat flags "size 0, but the first cluster ...".
+	copy(rootBuf[freeOff:], makeExFATEntrySet(name, attrs, cluster, uint64(fs.info.ClusterSize())))
 	return fs.writeDirBuf(parentCluster, rootBuf)
 }
 
