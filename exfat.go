@@ -256,7 +256,10 @@ func (fs *exfatFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 	numNameEntries := (len(nameWords) + nameCharsPerEntry - 1) / nameCharsPerEntry
 	freeOff := exfatFindFreeSlot(rootBuf, 2+numNameEntries)
 	if freeOff < 0 {
-		return fmt.Errorf("exfat: directory is full")
+		rootBuf, freeOff, err = fs.growDirForSlot(parentDirPath(path), parentCluster, rootBuf, 2+numNameEntries)
+		if err != nil {
+			return err
+		}
 	}
 	var attrs uint16 = 0x20 // archive
 	if perm&0o200 == 0 {
@@ -288,7 +291,10 @@ func (fs *exfatFS) MkDir(path string, perm os.FileMode) error {
 	numNameEntries := (len(nameWords) + nameCharsPerEntry - 1) / nameCharsPerEntry
 	freeOff := exfatFindFreeSlot(rootBuf, 2+numNameEntries)
 	if freeOff < 0 {
-		return fmt.Errorf("exfat: directory is full")
+		rootBuf, freeOff, err = fs.growDirForSlot(parentDirPath(path), parentCluster, rootBuf, 2+numNameEntries)
+		if err != nil {
+			return err
+		}
 	}
 	cluster, err := fs.allocCluster()
 	if err != nil {
@@ -306,7 +312,9 @@ func (fs *exfatFS) MkDir(path string, perm os.FileMode) error {
 	if perm&0o200 == 0 {
 		attrs |= uint16(exfatAttrReadOnly)
 	}
-	copy(rootBuf[freeOff:], makeExFATEntrySet(name, attrs, cluster, 0))
+	// A directory's data length must equal its allocated size (one cluster
+	// here), not 0 — fsck.exfat flags "size 0, but the first cluster ...".
+	copy(rootBuf[freeOff:], makeExFATEntrySet(name, attrs, cluster, uint64(fs.info.ClusterSize())))
 	return fs.writeDirBuf(parentCluster, rootBuf)
 }
 
@@ -862,6 +870,90 @@ func (fs *exfatFS) getParentDir(path string) (name string, parentCluster uint32,
 }
 
 // readClusterChain follows the FAT chain starting at start and returns up to size bytes.
+// parentDirPath returns the path of the directory containing p (e.g.
+// "/big/x" → "/big", "/a" → "/").
+func parentDirPath(p string) string {
+	parts := pathComponents(p)
+	if len(parts) <= 1 {
+		return "/"
+	}
+	return "/" + strings.Join(parts[:len(parts)-1], "/")
+}
+
+// growDirForSlot extends directory dirCluster by one cluster (chaining it in
+// the FAT and marking the allocation bitmap), so that buf gains room for a
+// setSize-entry set. When the directory is not the root, its DataLength in its
+// parent's entry is updated to match the new size (exFAT records a directory's
+// size there, and fsck.exfat flags a mismatch). Returns the grown buffer and
+// the offset of a free slot.
+func (fs *exfatFS) growDirForSlot(dirPath string, dirCluster uint32, buf []byte, setSize int) ([]byte, int, error) {
+	newCluster, err := fs.allocCluster()
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := fs.setFATEntry(newCluster, 0xFFFFFFFF); err != nil {
+		return nil, 0, err
+	}
+	// Walk to the directory's current last cluster and chain the new one on.
+	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
+	last := dirCluster
+	for {
+		var nb [4]byte
+		if _, err := fs.f.ReadAt(nb[:], fatBase+int64(last)*4); err != nil {
+			return nil, 0, err
+		}
+		n := binary.LittleEndian.Uint32(nb[:])
+		if n < 2 || n >= 0xFFFFFFF8 {
+			break
+		}
+		last = n
+	}
+	if err := fs.setFATEntry(last, newCluster); err != nil {
+		return nil, 0, err
+	}
+	buf = append(buf, make([]byte, int(fs.info.ClusterSize()))...)
+	if dirPath != "/" {
+		if err := fs.updateDirDataLength(dirPath, uint64(len(buf))); err != nil {
+			return nil, 0, err
+		}
+	}
+	slot := exfatFindFreeSlot(buf, setSize)
+	if slot < 0 {
+		return nil, 0, fmt.Errorf("exfat: directory still full after growth")
+	}
+	return buf, slot, nil
+}
+
+// updateDirDataLength rewrites the ValidDataLength/DataLength of directory
+// dirPath's entry in its parent directory (and the entry-set checksum) to
+// newLen. dirPath must not be the root.
+func (fs *exfatFS) updateDirDataLength(dirPath string, newLen uint64) error {
+	parts := pathComponents(dirPath)
+	name := parts[len(parts)-1]
+	parentCluster := fs.info.RootDirectoryCluster
+	if len(parts) > 1 {
+		parent, _, err := fs.resolvePath("/" + strings.Join(parts[:len(parts)-1], "/"))
+		if err != nil {
+			return err
+		}
+		parentCluster = parent.cluster
+	}
+	buf, err := fs.readDirBuf(parentCluster)
+	if err != nil {
+		return err
+	}
+	off, sec := exfatFindEntry(buf, name)
+	if off < 0 {
+		return fmt.Errorf("exfat: directory %q entry not found for size update", dirPath)
+	}
+	stream := buf[off+dirEntrySize:]
+	binary.LittleEndian.PutUint64(stream[8:16], newLen)  // ValidDataLength
+	binary.LittleEndian.PutUint64(stream[24:32], newLen) // DataLength
+	setLen := (sec + 1) * dirEntrySize
+	binary.LittleEndian.PutUint16(buf[off+2:off+4], exfatEntrySetChecksum(buf[off:off+setLen]))
+	return fs.writeDirBuf(parentCluster, buf)
+}
+
 func (fs *exfatFS) readClusterChain(start uint32, size uint64) ([]byte, error) {
 	if start == 0 {
 		return []byte{}, nil
