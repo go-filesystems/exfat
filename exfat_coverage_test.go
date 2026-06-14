@@ -90,6 +90,9 @@ func buildExFATFullRootDirImage(t *testing.T) string {
 	return path
 }
 
+// A full directory now grows by an extra cluster rather than failing, so
+// WriteFile/MkDir into a full root directory succeed and the new entry is
+// readable.
 func TestWriteFileRootDirFull(t *testing.T) {
 	path := buildExFATFullRootDirImage(t)
 	fs, err := Open(path, -1)
@@ -97,8 +100,11 @@ func TestWriteFileRootDirFull(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer fs.Close()
-	if err := fs.WriteFile("/zzznewfile.txt", []byte("x"), 0o644); err == nil {
-		t.Fatal("WriteFile with full root dir error = nil, want error")
+	if err := fs.WriteFile("/zzznewfile.txt", []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile into full root dir should grow it, got: %v", err)
+	}
+	if _, err := fs.Stat("/zzznewfile.txt"); err != nil {
+		t.Fatalf("Stat after growth: %v", err)
 	}
 }
 
@@ -109,8 +115,11 @@ func TestMkDirRootDirFull(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer fs.Close()
-	if err := fs.MkDir("/zzznewdir", 0o755); err == nil {
-		t.Fatal("MkDir with full root dir error = nil, want error")
+	if err := fs.MkDir("/zzznewdir", 0o755); err != nil {
+		t.Fatalf("MkDir into full root dir should grow it, got: %v", err)
+	}
+	if _, err := fs.Stat("/zzznewdir"); err != nil {
+		t.Fatalf("Stat after growth: %v", err)
 	}
 }
 
