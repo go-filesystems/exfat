@@ -1,0 +1,174 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Native runners: full vet + build + test (race + coverage), exactly as a
+  # developer runs it locally via the Taskfile.
+  native:
+    name: native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout exfat
+        uses: actions/checkout@v4
+        with:
+          path: exfat
+
+      # go.mod carries `replace github.com/go-filesystems/interface =>
+      # ../interface`, so the sibling module must sit next to this one.
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-filesystems/interface
+          path: interface
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: exfat/go.mod
+
+      - name: Vet
+        working-directory: exfat
+        run: go vet -mod=mod ./...
+
+      - name: Build
+        working-directory: exfat
+        run: go build -mod=mod ./...
+
+      - name: Test (race + coverage)
+        working-directory: exfat
+        run: go test -mod=mod -race -coverprofile=cover.out -covermode=atomic ./...
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.arch }}
+          path: exfat/cover.out
+          if-no-files-found: ignore
+
+  # Emulated runners: cross-compile a static (CGO_ENABLED=0) test binary and
+  # run it under QEMU for each non-native 64-bit arch. exFAT on-disk
+  # structures are little-endian; the boot-sector / directory-entry / FAT /
+  # bitmap decoders all use explicit binary.LittleEndian, so reads stay
+  # host-endianness-independent. s390x (big-endian) is the real test of that.
+  #
+  # The compat test reads the relative fixture testdata/mkfs/image.exfat.gz,
+  # so the test binary is built into the checkout (next to testdata/) and run
+  # with that directory as the working directory inside the container.
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu: qemu
+    steps:
+      - name: Checkout exfat
+        uses: actions/checkout@v4
+        with:
+          path: exfat
+
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-filesystems/interface
+          path: interface
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: exfat/go.mod
+
+      - name: Register QEMU binfmt handlers
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+
+      - name: Cross-compile per-package test binaries
+        working-directory: exfat
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          built=0
+          for pkg in $(go list -mod=mod ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            # Build the test binary into the package directory so relative
+            # fixtures (testdata/) resolve at run time. Skip packages with no
+            # test files (go test -c emits no binary).
+            dir=$(go list -mod=mod -f '{{.Dir}}' "$pkg")
+            go test -mod=mod -c -cover -o "${dir}/${name}.test" "$pkg"
+            if [ -f "${dir}/${name}.test" ]; then
+              echo "built ${dir}/${name}.test"
+              built=$((built+1))
+            fi
+          done
+          echo "built ${built} test binaries"
+
+      - name: Run test binaries under QEMU (${{ matrix.arch }})
+        working-directory: exfat
+        env:
+          QEMU_CPU: ${{ matrix.qemu }}
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          bins=(**/*.test)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "no test binaries to run"; exit 0
+          fi
+          repo=$(pwd)
+          rc=0
+          for bin in "${bins[@]}"; do
+            echo "::group::${bin}"
+            dir=$(dirname "${bin}")
+            base=$(basename "${bin}")
+            # Mount the package directory (with its testdata/) and run there
+            # so relative fixture paths resolve. --user 1000:1000 avoids
+            # root-in-container surprises.
+            if ! docker run --rm \
+              --platform linux/${{ matrix.arch }} \
+              --user 1000:1000 \
+              -e QEMU_CPU="${QEMU_CPU}" \
+              -v "${repo}/${dir}:/t" -w /t \
+              ${{ matrix.image }} \
+              "./${base}" -test.v; then
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
