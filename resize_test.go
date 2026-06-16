@@ -524,13 +524,8 @@ func TestResizeThenFsckExfat(t *testing.T) {
 
 	out, err := runFsck(t, fsckBin, target)
 	t.Logf("%s -n %s output (after grow+shrink):\n%s", fsckName, target, out)
-	if err != nil {
-		if !fsckLooksClean(out) {
-			t.Fatalf("%s reported errors: %v\n%s", fsckName, err, out)
-		}
-	}
-	if !fsckLooksClean(out) {
-		t.Errorf("%s did not report a clean filesystem after resize:\n%s", fsckName, out)
+	if !fsckLooksClean(out, err) {
+		t.Fatalf("%s did not report a clean filesystem after resize (err=%v):\n%s", fsckName, err, out)
 	}
 }
 

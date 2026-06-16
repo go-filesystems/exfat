@@ -248,23 +248,55 @@ func attachAsRawDevice(t *testing.T, imgPath string) (string, func()) {
 	return raw, cleanup
 }
 
-// fsckLooksClean inspects fsck output for the expected "no errors" /
-// "clean" signal. Different fsck implementations word their verdicts
-// differently:
+// fsckLooksClean inspects a fsck run for the expected "no errors" /
+// "clean" verdict. Different fsck implementations word their verdicts
+// differently across versions:
 //
 //   - exfatprogs (Linux):       "No error found"
+//   - exfatprogs 1.2.9 (Linux): "<path>: clean. directories N, files M"
 //   - Apple fsck_exfat:         "The volume … appears to be OK" (or
 //                                "clean").
 //
-// We treat any of those substrings as success.
-func fsckLooksClean(out string) bool {
+// Rather than chase every exact phrase, we treat a run as clean when the
+// checker exited 0 and its output mentions "clean" (or one of the legacy
+// "no errors"/"OK" verdicts) without any error/corruption marker. The
+// errors-found / "would fix" rc paths are handled by the caller, which
+// surfaces the output before failing.
+//
+// runErr is the error returned by exec (non-nil ⇒ non-zero exit). A
+// non-zero exit is never treated as clean. We still refuse to call output
+// clean if it carries a corruption marker, so a real driver bug cannot be
+// papered over.
+func fsckLooksClean(out string, runErr error) bool {
+	if runErr != nil {
+		// Non-zero exit: the checker is signalling a problem (or that it
+		// would fix something). Not clean.
+		return false
+	}
 	low := strings.ToLower(out)
+	// Hard "this is broken" markers veto a clean verdict regardless of exit
+	// code, so we never ignore genuine corruption.
+	for _, bad := range []string{
+		"corrupt",
+		"error",
+		"errors found",
+		"would fix",
+		"need to repair",
+	} {
+		if strings.Contains(low, bad) {
+			// "no error found" / "no errors" contains "error" but is a
+			// clean verdict, so re-check those explicitly below.
+			if strings.Contains(low, "no error") {
+				continue
+			}
+			return false
+		}
+	}
 	for _, marker := range []string{
 		"no error found",
+		"no errors",
 		"appears to be ok",
-		"is clean",
-		"volume is clean",
-		"file system clean",
+		"clean",
 	} {
 		if strings.Contains(low, marker) {
 			return true
@@ -308,16 +340,8 @@ func TestWriteThenFsckExfat(t *testing.T) {
 
 	out, err := runFsck(t, fsckBin, target)
 	t.Logf("%s -n %s output:\n%s", fsckName, target, out)
-	if err != nil {
-		// Some fsck variants use non-zero rc to signal "would fix
-		// something" even in -n mode. Surface the output for diagnosis
-		// and only fail when the verdict text also looks bad.
-		if !fsckLooksClean(out) {
-			t.Fatalf("%s reported errors: %v\n%s", fsckName, err, out)
-		}
-	}
-	if !fsckLooksClean(out) {
-		t.Errorf("%s did not report a clean filesystem:\n%s", fsckName, out)
+	if !fsckLooksClean(out, err) {
+		t.Fatalf("%s did not report a clean filesystem (err=%v):\n%s", fsckName, err, out)
 	}
 }
 
