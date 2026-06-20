@@ -110,17 +110,10 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	if clusterCount < 1 {
 		return nil, fmt.Errorf("exfat: format: size %d too small", sizeBytes)
 	}
-	// System-file layout: the allocation bitmap (one bit per data cluster,
-	// possibly spanning several clusters for large volumes) starts at cluster
-	// 2, followed by the up-case table and the root directory.
-	bitmapSizeBytes := (uint64(clusterCount) + 7) / 8
-	bitmapClusters := uint32((bitmapSizeBytes + uint64(clusterSize) - 1) / uint64(clusterSize))
-	bitmapCluster := uint32(fmtBitmapCluster)
-	upcaseCluster := bitmapCluster + bitmapClusters
-	rootDirCluster := upcaseCluster + 1
-	sysClusters := bitmapClusters + 2 // bitmap chain + upcase + root
-	if clusterCount < sysClusters {
-		return nil, fmt.Errorf("exfat: format: size %d leaves only %d data clusters; need ≥%d for bitmap+upcase+root", sizeBytes, clusterCount, sysClusters)
+	// We need at least 3 data clusters (bitmap, up-case, root). Reject sizes
+	// that can't satisfy the mandatory system-file layout.
+	if clusterCount < 3 {
+		return nil, fmt.Errorf("exfat: format: size %d leaves only %d data clusters; need ≥3 for bitmap+upcase+root", sizeBytes, clusterCount)
 	}
 
 	// dataClusterOffset returns the absolute byte offset of the start of
@@ -182,7 +175,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	le.PutUint32(boot[84:], uint32(fatLength))
 	le.PutUint32(boot[88:], uint32(clusterHeapOffset))
 	le.PutUint32(boot[92:], clusterCount)
-	le.PutUint32(boot[96:], rootDirCluster)
+	le.PutUint32(boot[96:], fmtRootDirCluster)
 	le.PutUint32(boot[100:], serialNumber)
 	le.PutUint16(boot[104:], 0x0100) // revision 1.00
 	// VolumeFlags = 0, DriveSelect = 0x80
@@ -276,37 +269,34 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	}
 
 	// ── FAT ───────────────────────────────────────────────────────────────────
-	// FAT[0] = 0xFFFFFFF8 (media type), FAT[1] = 0xFFFFFFFF (reserved). The
-	// allocation bitmap occupies a contiguous chain of bitmapClusters clusters
-	// starting at cluster 2; the up-case table and root directory follow, each
-	// a single cluster.
-	fatBuf := make([]byte, int(rootDirCluster+1)*4)
+	// FAT[0] = 0xFFFFFFF8 (media type), FAT[1] = 0xFFFFFFFF (reserved).
+	// FAT[2] = Allocation Bitmap chain EOC (single cluster).
+	// FAT[3] = Up-case Table chain EOC      (single cluster).
+	// FAT[4] = Root Directory chain EOC     (single cluster).
+	fatBuf := make([]byte, 5*4)
 	le.PutUint32(fatBuf[0:], 0xFFFFFFF8) // FAT[0]
 	le.PutUint32(fatBuf[4:], 0xFFFFFFFF) // FAT[1]
-	for c := bitmapCluster; c < bitmapCluster+bitmapClusters; c++ {
-		if c == bitmapCluster+bitmapClusters-1 {
-			le.PutUint32(fatBuf[c*4:], 0xFFFFFFFF) // last bitmap cluster: EOC
-		} else {
-			le.PutUint32(fatBuf[c*4:], c+1) // chain to the next bitmap cluster
-		}
-	}
-	le.PutUint32(fatBuf[upcaseCluster*4:], 0xFFFFFFFF)  // up-case EOC
-	le.PutUint32(fatBuf[rootDirCluster*4:], 0xFFFFFFFF) // root EOC
+	le.PutUint32(fatBuf[8:], 0xFFFFFFFF) // FAT[2] bitmap EOC
+	le.PutUint32(fatBuf[12:], 0xFFFFFFFF) // FAT[3] upcase EOC
+	le.PutUint32(fatBuf[16:], 0xFFFFFFFF) // FAT[4] root EOC
 	fatOff := int64(fmtFATOffset) * bytesPerSector
 	if _, err := f.WriteAt(fatBuf, fatOff); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("exfat: format: write FAT: %w", err)
 	}
 
-	// ── Allocation Bitmap (clusters 2..) ─────────────────────────────────────
-	// One bit per data cluster, bit 0 == cluster 2. Mark the system clusters
-	// (the bitmap chain itself, the up-case table, and the root directory)
-	// allocated; everything else is free. The bitmap may span several clusters.
-	bitmap := make([]byte, int(bitmapClusters)*int(clusterSize))
-	for i := uint32(0); i < sysClusters; i++ {
-		bitmap[i/8] |= 1 << (i % 8)
+	// ── Allocation Bitmap (cluster 2) ────────────────────────────────────────
+	// One bit per data cluster, with bit 0 == cluster 2. We mark clusters 2,
+	// 3 and 4 (bitmap, upcase, root) allocated; everything else is free.
+	bitmapSizeBytes := (uint64(clusterCount) + 7) / 8
+	if bitmapSizeBytes > uint64(clusterSize) {
+		f.Close()
+		return nil, fmt.Errorf("exfat: format: bitmap size %d exceeds one cluster", bitmapSizeBytes)
 	}
-	bitmapOff := dataClusterOffset(bitmapCluster)
+	bitmap := make([]byte, clusterSize)
+	// Bit i corresponds to cluster (i+2). Mark first three system clusters.
+	bitmap[0] = 0b0000_0111
+	bitmapOff := dataClusterOffset(fmtBitmapCluster)
 	if _, err := f.WriteAt(bitmap, bitmapOff); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("exfat: format: write allocation bitmap: %w", err)
@@ -329,7 +319,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	upcaseChecksum := exfatTableChecksum(upcaseTable)
 	upcaseClusterBuf := make([]byte, clusterSize)
 	copy(upcaseClusterBuf, upcaseTable)
-	upcaseOff := dataClusterOffset(upcaseCluster)
+	upcaseOff := dataClusterOffset(fmtUpcaseCluster)
 	if _, err := f.WriteAt(upcaseClusterBuf, upcaseOff); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("exfat: format: write up-case table: %w", err)
@@ -344,14 +334,14 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	// Allocation Bitmap entry: type 0x81.
 	rootBuf[0] = 0x81
 	// BitmapFlags = 0 (first FAT)
-	le.PutUint32(rootBuf[20:], bitmapCluster)   // FirstCluster
-	le.PutUint64(rootBuf[24:], bitmapSizeBytes) // DataLength
+	le.PutUint32(rootBuf[20:], fmtBitmapCluster)            // FirstCluster
+	le.PutUint64(rootBuf[24:], bitmapSizeBytes)             // DataLength
 	// Up-case Table entry: type 0x82.
 	rootBuf[dirEntrySize+0] = 0x82
 	le.PutUint32(rootBuf[dirEntrySize+4:], upcaseChecksum) // TableChecksum
-	le.PutUint32(rootBuf[dirEntrySize+20:], upcaseCluster)
+	le.PutUint32(rootBuf[dirEntrySize+20:], fmtUpcaseCluster)
 	le.PutUint64(rootBuf[dirEntrySize+24:], uint64(len(upcaseTable)))
-	rootOff := dataClusterOffset(rootDirCluster)
+	rootOff := dataClusterOffset(fmtRootDirCluster)
 	if _, err := f.WriteAt(rootBuf, rootOff); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("exfat: format: write root directory: %w", err)
