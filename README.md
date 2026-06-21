@@ -1,4 +1,10 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems-exfat.png" alt="go-filesystems/exfat" width="720"></p>
+
 # exfat
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-filesystems/exfat.svg)](https://pkg.go.dev/github.com/go-filesystems/exfat)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![CI](https://github.com/go-filesystems/exfat/actions/workflows/ci.yml/badge.svg)](https://github.com/go-filesystems/exfat/actions/workflows/ci.yml)
 
 Pure-Go read/write access to exFAT filesystem images — no root privileges, no external tools, no CGO.
 
@@ -104,4 +110,3 @@ defer f.Close()
 var fs filesystem.Filesystem = f
 _, _ = fs.ReadFile("/hello.txt")
 ```
-
