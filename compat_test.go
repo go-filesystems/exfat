@@ -255,7 +255,7 @@ func attachAsRawDevice(t *testing.T, imgPath string) (string, func()) {
 //   - exfatprogs (Linux):       "No error found"
 //   - exfatprogs 1.2.9 (Linux): "<path>: clean. directories N, files M"
 //   - Apple fsck_exfat:         "The volume … appears to be OK" (or
-//                                "clean").
+//     "clean").
 //
 // Rather than chase every exact phrase, we treat a run as clean when the
 // checker exited 0 and its output mentions "clean" (or one of the legacy

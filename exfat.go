@@ -2,14 +2,18 @@ package filesystem_exfat
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"time"
 	"unicode/utf16"
 
 	filesystem "github.com/go-filesystems/interface"
+	"github.com/go-volumes/gpt"
+	"github.com/go-volumes/safeio"
 )
 
 const (
@@ -566,14 +570,39 @@ func readInfo(r io.ReaderAt, partOffset int64) (Info, error) {
 	}, nil
 }
 
+// readerSize reports the byte length of r when it can be discovered cheaply,
+// so the hardened go-volumes/gpt parser can validate partition offsets
+// against the real device extent. *os.File exposes it via Stat; bytes.Reader
+// and io.SectionReader expose a Size() method. When the size cannot be
+// determined we fall back to math.MaxInt64, which still lets gpt apply its
+// allocation/overflow caps (MaxEntrySize, MaxPartitionEntries) — only the
+// secondary "partition lies within the device" check is relaxed.
+func readerSize(r io.ReaderAt) int64 {
+	if s, ok := r.(interface{ Size() int64 }); ok {
+		if n := s.Size(); n > 0 {
+			return n
+		}
+	}
+	if s, ok := r.(interface{ Stat() (os.FileInfo, error) }); ok {
+		if fi, err := s.Stat(); err == nil && fi.Size() > 0 {
+			return fi.Size()
+		}
+	}
+	return math.MaxInt64
+}
+
+// partitionOffset locates the byte offset of the selected partition, hardened
+// against malicious/corrupt partition tables via go-volumes/gpt.
+//
+// A bare exFAT volume is not partitioned: when the caller asks for
+// auto-detection (partIndex < 0) and the image begins with a raw exFAT boot
+// sector (OEM name "EXFAT   " at bytes 3..11), we short-circuit to offset 0.
+// Real exFAT volumes also carry the 0x55 0xAA signature at offset 510, which
+// the partition probe would otherwise misread as an MBR — yielding garbage
+// start-LBA values when the MBR-equivalent bytes contain formatter noise
+// (e.g. macOS newfs_exfat). This bare-volume pre-check stays the caller's
+// responsibility; gpt.List itself returns ErrNoTable for such an image.
 func partitionOffset(r io.ReaderAt, partIndex int) (int64, error) {
-	// When the caller explicitly asks for an auto-detected partition (partIndex == -1)
-	// and the image already starts with a raw exFAT boot sector (OEM name "EXFAT   "
-	// at bytes 3..11), treat it as a non-partitioned image. Real exFAT volumes also
-	// carry the 0x55 0xAA signature at offset 510, which would otherwise be
-	// misidentified as an MBR by the heuristic below — yielding garbage start-LBA
-	// values when the MBR-equivalent bytes (446..509) contain non-zero data put
-	// there by the formatter (e.g. macOS newfs_exfat).
 	if partIndex < 0 {
 		var oem [8]byte
 		if _, err := r.ReadAt(oem[:], 3); err == nil && string(oem[:]) == "EXFAT   " {
@@ -581,91 +610,31 @@ func partitionOffset(r io.ReaderAt, partIndex int) (int64, error) {
 		}
 	}
 
-	var sig [8]byte
-	if _, err := r.ReadAt(sig[:], sectorSize); err == nil && string(sig[:]) == "EFI PART" {
-		return gptPartOffset(r, partIndex)
-	}
-
-	var magic [2]byte
-	if _, err := r.ReadAt(magic[:], 510); err == nil && magic[0] == 0x55 && magic[1] == 0xAA {
-		return mbrPartOffset(r, partIndex)
-	}
-
-	return 0, nil
-}
-
-func gptPartOffset(r io.ReaderAt, partIndex int) (int64, error) {
-	hdr := make([]byte, 92)
-	if _, err := r.ReadAt(hdr, sectorSize); err != nil {
-		return 0, fmt.Errorf("exfat: read GPT header: %w", err)
-	}
-	le := binary.LittleEndian
-	partEntryLBA := le.Uint64(hdr[72:])
-	numParts := le.Uint32(hdr[80:])
-	entrySize := le.Uint32(hdr[84:])
-	if entrySize < 128 {
-		return 0, fmt.Errorf("exfat: unexpected GPT entry size %d", entrySize)
-	}
-
-	tableOff := int64(partEntryLBA) * sectorSize
-	buf := make([]byte, entrySize)
-	for index := uint32(0); index < numParts; index++ {
-		if _, err := r.ReadAt(buf, tableOff+int64(index)*int64(entrySize)); err != nil {
-			break
-		}
-		var typeGUID [16]byte
-		copy(typeGUID[:], buf[:16])
-		startLBA := le.Uint64(buf[32:])
-
-		if partIndex >= 0 {
-			if int(index) != partIndex {
-				continue
-			}
-			if typeGUID == [16]byte{} || startLBA == 0 {
-				return 0, fmt.Errorf("exfat: GPT partition index %d not found", partIndex)
-			}
-			return int64(startLBA) * sectorSize, nil
-		}
-
-		if typeGUID != [16]byte{} && startLBA != 0 {
-			return int64(startLBA) * sectorSize, nil
-		}
-	}
-
+	size := readerSize(r)
+	var part gpt.Partition
+	var err error
 	if partIndex >= 0 {
-		return 0, fmt.Errorf("exfat: GPT partition index %d not found", partIndex)
+		part, err = gpt.ByIndex(r, size, partIndex)
+	} else {
+		part, err = gpt.First(r, size)
 	}
-	return 0, fmt.Errorf("exfat: no populated GPT partition found")
-}
-
-func mbrPartOffset(r io.ReaderAt, partIndex int) (int64, error) {
-	table := make([]byte, 64)
-	if _, err := r.ReadAt(table, 446); err != nil {
-		return 0, fmt.Errorf("exfat: read MBR partition table: %w", err)
-	}
-	for index := 0; index < 4; index++ {
-		entry := table[index*16:]
-		startLBA := binary.LittleEndian.Uint32(entry[8:])
-
-		if partIndex >= 0 {
-			if index != partIndex {
-				continue
-			}
-			if startLBA == 0 {
-				return 0, fmt.Errorf("exfat: MBR partition index %d not found", partIndex)
-			}
-			return int64(startLBA) * sectorSize, nil
+	if err != nil {
+		// A bare filesystem image carries no partition table; treat it as a
+		// non-partitioned volume at offset 0, matching the original heuristic.
+		if errors.Is(err, gpt.ErrNoTable) {
+			return 0, nil
 		}
-
-		if startLBA != 0 {
-			return int64(startLBA) * sectorSize, nil
+		// In auto-detect mode an empty-but-present table (e.g. an exFAT
+		// volume whose 0x55 0xAA signature looked like an MBR with no
+		// populated entries) also degrades to the bare-volume reading at
+		// offset 0, preserving the original heuristic. An explicit index
+		// request still surfaces "not found".
+		if partIndex < 0 && errors.Is(err, gpt.ErrNotFound) {
+			return 0, nil
 		}
+		return 0, fmt.Errorf("exfat: partition table: %w", err)
 	}
-
-	if partIndex >= 0 {
-		return 0, fmt.Errorf("exfat: MBR partition index %d not found", partIndex)
-	}
-	return 0, nil
+	return part.StartOffset, nil
 }
 
 func parseRootDirEntries(buf []byte) ([]filesystem.DirEntry, error) {
@@ -772,8 +741,22 @@ func (fs *exfatFS) writeDirBuf(startCluster uint32, buf []byte) error {
 	clusterSize := int64(fs.info.ClusterSize())
 	dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
 	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
+	// Bound the walk to ClusterCount+1 iterations and reject a cyclic /
+	// self-referential chain, so a corrupt directory FAT cannot make
+	// writeDirBuf loop forever (finding C1).
+	guard := safeio.NewLoopGuard(int(fs.info.ClusterCount) + 1)
+	var seen safeio.VisitSet
 	cluster := startCluster
 	for pos := 0; pos < len(buf); pos += int(clusterSize) {
+		if cluster < 2 || cluster >= 0xFFFFFFF7 {
+			return fmt.Errorf("exfat: directory chain from %d: invalid cluster %d", startCluster, cluster)
+		}
+		if err := guard.Next(); err != nil {
+			return fmt.Errorf("exfat: directory chain from %d: %w", startCluster, err)
+		}
+		if err := seen.Check(uint64(cluster)); err != nil {
+			return fmt.Errorf("exfat: directory chain from %d: %w", startCluster, err)
+		}
 		off := dataBase + int64(cluster-2)*clusterSize
 		end := pos + int(clusterSize)
 		if end > len(buf) {
@@ -861,7 +844,30 @@ func (fs *exfatFS) getParentDir(path string) (name string, parentCluster uint32,
 	return name, parent.cluster, nil
 }
 
-// readClusterChain follows the FAT chain starting at start and returns up to size bytes.
+// maxChainBytes returns the absolute upper bound on the number of bytes any
+// cluster chain in this volume can occupy: every cluster present in the heap,
+// each ClusterSize bytes. It is the ceiling used to reject an attacker
+// dataLength (e.g. 2^63) before it reaches make([]byte, …) — a corrupt image
+// can never legitimately address more data than the heap can hold. The
+// product is computed in uint64; ClusterCount is a uint32 and ClusterSize is
+// bounded by the boot-sector shift validation (≤ 32 MiB), so it cannot wrap.
+func (fs *exfatFS) maxChainBytes() uint64 {
+	return uint64(fs.info.ClusterCount) * fs.info.ClusterSize()
+}
+
+// readClusterChain follows the FAT chain starting at start and returns up to
+// size bytes. It is hardened against malicious/corrupt images:
+//
+//   - the requested size is clamped to the heap capacity (maxChainBytes) and
+//     the backing buffer is allocated through safeio.MakeBytes, so an
+//     attacker dataLength such as 2^63 yields a bounded allocation, not OOM
+//     (finding C2);
+//   - a safeio.VisitSet rejects a self-referential or cyclic FAT chain, and a
+//     safeio.LoopGuard sized to ClusterCount caps the walk, so a malformed
+//     chain terminates with an error instead of looping forever / OOMing
+//     (finding C1);
+//   - the walk stops as soon as len(buf) >= size, so only the requested
+//     prefix is materialised.
 func (fs *exfatFS) readClusterChain(start uint32, size uint64) ([]byte, error) {
 	if start == 0 {
 		return []byte{}, nil
@@ -869,11 +875,39 @@ func (fs *exfatFS) readClusterChain(start uint32, size uint64) ([]byte, error) {
 	clusterSize := int64(fs.info.ClusterSize())
 	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
 	dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
-	buf := make([]byte, 0, size)
+
+	// Bound the caller-/attacker-supplied size against what the heap can
+	// actually hold. maxChainBytes is ClusterCount (uint32) × ClusterSize
+	// (≤ 32 MiB), so it is always well below 2^63 and fits in int64.
+	// safeio.MakeBytes rejects a size that exceeds that cap (or that
+	// overflows int64, e.g. an attacker dataLength of 2^63); when it does, we
+	// clamp to the cap and continue rather than fail, since a short read is
+	// the correct outcome for an over-long declared length. The buffer starts
+	// empty and grows incrementally as clusters are appended, so no single
+	// huge allocation is ever made (finding C2).
+	capBytes := fs.maxChainBytes()
+	if _, err := safeio.MakeBytes(int64(size), int64(capBytes)); err != nil {
+		size = capBytes
+	}
+	buf := make([]byte, 0)
+
+	// VisitSet rejects a chain that revisits any cluster (a cycle). Because
+	// the walk appends one cluster (clusterSize bytes) per iteration and size
+	// is clamped to ClusterCount*ClusterSize, the loop terminates after at
+	// most ClusterCount iterations even on a maximal acyclic chain, so the
+	// visited set can hold at most ClusterCount entries — bounded memory, no
+	// separate LoopGuard needed here.
+	var seen safeio.VisitSet
 	cluster := start
 	for {
 		if cluster < 2 || cluster >= 0xFFFFFFF7 {
 			break
+		}
+		if uint64(len(buf)) >= size {
+			break
+		}
+		if err := seen.Check(uint64(cluster)); err != nil {
+			return nil, fmt.Errorf("exfat: cluster chain from %d: %w", start, err)
 		}
 		clusterBuf := make([]byte, clusterSize)
 		off := dataBase + int64(cluster-2)*clusterSize
@@ -1010,8 +1044,19 @@ func (fs *exfatFS) setFATEntry(cluster uint32, value uint32) error {
 // and Allocation Bitmap in sync.
 func (fs *exfatFS) freeChain(start uint32) error {
 	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
+	// Bound the walk to ClusterCount+1 iterations and reject a cyclic /
+	// self-referential chain, so a corrupt FAT cannot make freeChain loop
+	// forever (finding C1).
+	guard := safeio.NewLoopGuard(int(fs.info.ClusterCount) + 1)
+	var seen safeio.VisitSet
 	cluster := start
 	for cluster >= 2 && cluster < 0xFFFFFFF7 {
+		if err := guard.Next(); err != nil {
+			return fmt.Errorf("exfat: free chain from %d: %w", start, err)
+		}
+		if err := seen.Check(uint64(cluster)); err != nil {
+			return fmt.Errorf("exfat: free chain from %d: %w", start, err)
+		}
 		var next [4]byte
 		if _, err := fs.f.ReadAt(next[:], fatBase+int64(cluster)*4); err != nil {
 			return fmt.Errorf("exfat: read FAT entry for cluster %d: %w", cluster, err)

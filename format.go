@@ -274,9 +274,9 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	// FAT[3] = Up-case Table chain EOC      (single cluster).
 	// FAT[4] = Root Directory chain EOC     (single cluster).
 	fatBuf := make([]byte, 5*4)
-	le.PutUint32(fatBuf[0:], 0xFFFFFFF8) // FAT[0]
-	le.PutUint32(fatBuf[4:], 0xFFFFFFFF) // FAT[1]
-	le.PutUint32(fatBuf[8:], 0xFFFFFFFF) // FAT[2] bitmap EOC
+	le.PutUint32(fatBuf[0:], 0xFFFFFFF8)  // FAT[0]
+	le.PutUint32(fatBuf[4:], 0xFFFFFFFF)  // FAT[1]
+	le.PutUint32(fatBuf[8:], 0xFFFFFFFF)  // FAT[2] bitmap EOC
 	le.PutUint32(fatBuf[12:], 0xFFFFFFFF) // FAT[3] upcase EOC
 	le.PutUint32(fatBuf[16:], 0xFFFFFFFF) // FAT[4] root EOC
 	fatOff := int64(fmtFATOffset) * bytesPerSector
@@ -334,8 +334,8 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	// Allocation Bitmap entry: type 0x81.
 	rootBuf[0] = 0x81
 	// BitmapFlags = 0 (first FAT)
-	le.PutUint32(rootBuf[20:], fmtBitmapCluster)            // FirstCluster
-	le.PutUint64(rootBuf[24:], bitmapSizeBytes)             // DataLength
+	le.PutUint32(rootBuf[20:], fmtBitmapCluster) // FirstCluster
+	le.PutUint64(rootBuf[24:], bitmapSizeBytes)  // DataLength
 	// Up-case Table entry: type 0x82.
 	rootBuf[dirEntrySize+0] = 0x82
 	le.PutUint32(rootBuf[dirEntrySize+4:], upcaseChecksum) // TableChecksum

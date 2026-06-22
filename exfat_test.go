@@ -13,7 +13,12 @@ import (
 type errorReaderAt struct {
 	data       []byte
 	failOffset int64
+	size       int64 // reported by Size(); used by readerSize for the gpt parser
 }
+
+// Size lets partitionOffset's readerSize discover the device extent so the
+// hardened go-volumes/gpt parser validates partition offsets against it.
+func (reader errorReaderAt) Size() int64 { return reader.size }
 
 func (reader errorReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	if off == reader.failOffset {
@@ -474,13 +479,14 @@ func TestPartitionOffsetVariants(t *testing.T) {
 	})
 
 	t.Run("gpt auto and index", func(t *testing.T) {
-		image := make([]byte, 12*sectorSize)
-		writeGPT(image, 2, []uint64{1024, 2048})
-		if off, err := partitionOffset(bytes.NewReader(image), -1); err != nil || off != int64(1024*sectorSize) {
-			t.Fatalf("partitionOffset(auto) = (%d, %v), want (%d, nil)", off, err, 1024*sectorSize)
+		// Device big enough that startLBA 40 and 48 fall inside it.
+		image := make([]byte, 64*sectorSize)
+		writeGPT(image, 2, []uint64{40, 48})
+		if off, err := partitionOffset(bytes.NewReader(image), -1); err != nil || off != int64(40*sectorSize) {
+			t.Fatalf("partitionOffset(auto) = (%d, %v), want (%d, nil)", off, err, 40*sectorSize)
 		}
-		if off, err := partitionOffset(bytes.NewReader(image), 1); err != nil || off != int64(2048*sectorSize) {
-			t.Fatalf("partitionOffset(index) = (%d, %v), want (%d, nil)", off, err, 2048*sectorSize)
+		if off, err := partitionOffset(bytes.NewReader(image), 1); err != nil || off != int64(48*sectorSize) {
+			t.Fatalf("partitionOffset(index) = (%d, %v), want (%d, nil)", off, err, 48*sectorSize)
 		}
 	})
 
@@ -491,22 +497,27 @@ func TestPartitionOffsetVariants(t *testing.T) {
 			t.Fatal("partitionOffset() error = nil, want GPT header error")
 		}
 
-		badEntrySize := make([]byte, 4*sectorSize)
+		badEntrySize := make([]byte, 64*sectorSize)
 		writeGPTHeaderOnly(badEntrySize, 2, 64, 1)
 		if _, err := partitionOffset(bytes.NewReader(badEntrySize), -1); err == nil {
 			t.Fatal("partitionOffset() error = nil, want GPT entry-size error")
 		}
 
-		truncated := make([]byte, 4*sectorSize)
+		truncated := make([]byte, 64*sectorSize)
 		writeGPTHeaderOnly(truncated, 2, 128, 1)
-		if _, err := partitionOffset(errorReaderAt{data: truncated, failOffset: 2 * sectorSize}, -1); err == nil {
+		// Size() reports the full image so the entry array passes the
+		// device-extent check, but the read at the table fails. The hardened
+		// parser stops at the unreadable entry and yields an empty table; an
+		// explicit index request surfaces "not found" rather than panicking.
+		if _, err := partitionOffset(errorReaderAt{data: truncated, failOffset: 2 * sectorSize, size: int64(len(truncated))}, 0); err == nil {
 			t.Fatal("partitionOffset() error = nil, want truncated GPT table error")
 		}
 
-		empty := make([]byte, 4*sectorSize)
+		empty := make([]byte, 64*sectorSize)
 		writeGPTHeaderOnly(empty, 2, 128, 1)
-		if _, err := partitionOffset(bytes.NewReader(empty), -1); err == nil {
-			t.Fatal("partitionOffset() error = nil, want missing GPT partition error")
+		// Auto mode degrades an empty-but-present table to offset 0.
+		if off, err := partitionOffset(bytes.NewReader(empty), -1); err != nil || off != 0 {
+			t.Fatalf("partitionOffset(auto empty GPT) = (%d, %v), want (0, nil)", off, err)
 		}
 		if _, err := partitionOffset(bytes.NewReader(empty), 0); err == nil {
 			t.Fatal("partitionOffset() error = nil, want missing GPT index error")
@@ -517,7 +528,7 @@ func TestPartitionOffsetVariants(t *testing.T) {
 	})
 
 	t.Run("mbr auto and index", func(t *testing.T) {
-		image := make([]byte, sectorSize)
+		image := make([]byte, 4096*sectorSize)
 		writeMBRPartition(image, 1, 2048)
 		if off, err := partitionOffset(bytes.NewReader(image), -1); err != nil || off != int64(2048*sectorSize) {
 			t.Fatalf("partitionOffset(auto) = (%d, %v), want (%d, nil)", off, err, 2048*sectorSize)
@@ -531,9 +542,10 @@ func TestPartitionOffsetVariants(t *testing.T) {
 		image := make([]byte, sectorSize)
 		image[510] = 0x55
 		image[511] = 0xAA
-		if _, err := partitionOffset(errorReaderAt{data: image, failOffset: 446}, -1); err == nil {
+		if _, err := partitionOffset(errorReaderAt{data: image, failOffset: 446, size: int64(len(image))}, -1); err == nil {
 			t.Fatal("partitionOffset() error = nil, want MBR read error")
 		}
+		// Auto mode on an MBR with no populated entries degrades to offset 0.
 		if off, err := partitionOffset(bytes.NewReader(image), -1); err != nil || off != 0 {
 			t.Fatalf("partitionOffset() = (%d, %v), want (0, nil)", off, err)
 		}
@@ -574,6 +586,9 @@ func writeMBRPartition(image []byte, index int, startLBA uint32) {
 	image[511] = 0xAA
 	entry := image[446+index*16:]
 	binary.LittleEndian.PutUint32(entry[8:], startLBA)
+	// One-sector partition: a non-zero sector count keeps the slot non-empty
+	// for the hardened go-volumes/gpt parser.
+	binary.LittleEndian.PutUint32(entry[12:], 1)
 	entry[4] = 0x07
 }
 
@@ -581,8 +596,12 @@ func writeGPT(image []byte, entryLBA uint64, starts []uint64) {
 	writeGPTHeaderOnly(image, entryLBA, 128, uint32(len(starts)))
 	for index, start := range starts {
 		entry := image[int(entryLBA)*sectorSize+index*128:]
+		// Non-zero type GUID marks the slot populated; the hardened parser
+		// skips all-zero-GUID entries.
 		entry[0] = byte(index + 1)
 		binary.LittleEndian.PutUint64(entry[32:], start)
+		// endLBA == startLBA: a one-sector partition that fits the device.
+		binary.LittleEndian.PutUint64(entry[40:], start)
 	}
 }
 
