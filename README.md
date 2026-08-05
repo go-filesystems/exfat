@@ -20,6 +20,9 @@ Supports bare filesystem images and MBR/GPT partitioned disks, full directory tr
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | ReadLink / Symlinks | ⚠️ No | exFAT does not support POSIX symlinks |
+| Volume label | ✅ | `Label` / `SetLabel` (`filesystem.Labeller`) |
+| Truncate | ✅ | `Truncate(path, newSize)` (`filesystem.Truncater`) |
+| Grow / Shrink / Resize | ✅ | Format provisions FAT headroom so `Grow` doesn't immediately need relocation |
 | Partitioned images | ✅ | MBR/GPT supported |
 
 ## Limitations
@@ -52,7 +55,13 @@ github.com/go-filesystems/exfat
 
 ## API
 
-### Format
+`Open` and `Format` return the plain `filesystem.Filesystem` interface (there
+is no richer exported `FS` type) — exFAT-specific extras (`Info`,
+`PartitionOffset`, volume label, truncate, resize) are reached by
+type-asserting to the optional interfaces from
+`github.com/go-filesystems/interface`, or to the package's own `Info` getter.
+
+### Format / Open
 
 ```go
 type FormatConfig struct {
@@ -60,42 +69,40 @@ type FormatConfig struct {
     VolumeSerialNumber uint32 // 0 = randomly generated
 }
 
-func Format(path string, sizeBytes int64, cfg FormatConfig) (*FS, error)
+func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesystem, error)
+func Open(imagePath string, partIndex int) (filesystem.Filesystem, error)
 ```
 
-### Open
+### Read / Write
+
+The returned value's `Stat` / `ListDir` / `ReadFile` / `WriteFile` / `MkDir` /
+`DeleteFile` / `DeleteDir` / `Rename` are exactly the
+[`filesystem.Filesystem`](https://github.com/go-filesystems/interface)
+contract — see that package's README for the full signatures.
+
+### exFAT-specific extras (type-assert)
 
 ```go
-func Open(imagePath string, partIndex int) (*FS, error)
-func (fs *FS) Close() error
-func (fs *FS) Info() Info
-func (fs *FS) PartitionOffset() int64
-```
-
-### Read
-
-```go
-func (fs *FS) Stat(path string) (filesystem.Stat, error)
-func (fs *FS) ListDir(path string) ([]filesystem.DirEntry, error)
-func (fs *FS) ReadFile(path string) ([]byte, error)
-```
-
-### Write
-
-```go
-func (fs *FS) WriteFile(path string, data []byte, perm os.FileMode) error
-func (fs *FS) MkDir(path string, perm os.FileMode) error
-func (fs *FS) DeleteFile(path string) error
-func (fs *FS) DeleteDir(path string) error
-func (fs *FS) Rename(oldPath, newPath string) error
+if l, ok := fs.(filesystem.Labeller); ok {
+    _ = l.SetLabel("MYVOL")
+}
+if t, ok := fs.(filesystem.Truncater); ok {
+    _ = t.Truncate("/big.bin", 4096)
+}
+if r, ok := fs.(interface{ Resize(int64) error }); ok {
+    _ = r.Resize(newSizeBytes) // also exposes Grow(int64) error / Shrink(int64) error
+}
+if i, ok := fs.(interface{ Info() Info }); ok {
+    fmt.Println(i.Info().ClusterSize())
+}
 ```
 
 ## Implements
 
 This package implements the `filesystem.Filesystem` interface defined in
-`github.com/go-filesystems/interface`. Callers can treat an opened `*FS`
-as a `filesystem.Filesystem` to write generic tooling that works across the
-other filesystem modules in this repository.
+`github.com/go-filesystems/interface`. Callers can treat the value returned
+by `Open`/`Format` as a `filesystem.Filesystem` to write generic tooling that
+works across the other filesystem modules in this repository.
 
 Example:
 
