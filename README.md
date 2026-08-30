@@ -17,6 +17,7 @@ Supports bare filesystem images and MBR/GPT partitioned disks, full directory tr
 | Open / Close | ✅ | Supports bare images and partitioned disks |
 | Format | ✅ | Creates exFAT images |
 | ReadFile | ✅ | Full file reads supported |
+| Read at an offset | ✅ | `OpenFile(path)` → `io.ReaderAt` + `Size()` (`filesystem.Opener` / `filesystem.File`) |
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | ReadLink / Symlinks | ⚠️ No | exFAT does not support POSIX symlinks |
@@ -46,6 +47,7 @@ github.com/go-filesystems/exfat
 | Stat         | ✅ implemented |
 | ListDir      | ✅ implemented |
 | ReadFile     | ✅ implemented |
+| OpenFile     | ✅ implemented (`filesystem.Opener`) |
 | WriteFile    | ✅ implemented |
 | MkDir        | ✅ implemented |
 | DeleteFile   | ✅ implemented |
@@ -83,6 +85,21 @@ contract — see that package's README for the full signatures.
 ### exFAT-specific extras (type-assert)
 
 ```go
+// Read part of a file without materialising all of it: OpenFile resolves the
+// FAT chain once (cluster numbers, not data) and then serves byte ranges, so a
+// 4 KiB read out of a 4 GiB file costs 4 KiB. Required by anything that mounts
+// or exports the volume.
+if o, ok := fs.(filesystem.Opener); ok {
+    f, err := o.OpenFile("/big.bin")
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+    buf := make([]byte, 4096)
+    n, err := f.ReadAt(buf, 1<<30) // io.ReaderAt semantics, exactly
+    _, _ = n, err
+    _ = f.Size()                   // from metadata; reads nothing
+}
 if l, ok := fs.(filesystem.Labeller); ok {
     _ = l.SetLabel("MYVOL")
 }
