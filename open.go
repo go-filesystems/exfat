@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 
 	filesystem "github.com/go-filesystems/interface"
@@ -30,14 +31,32 @@ var _ filesystem.Opener = (*exfatFS)(nil)
 // attacker-controlled dataLength to the cluster heap's real capacity, and reads
 // go through the same *exfatFS block layer. Nothing here bypasses either.
 //
-// Every field is written once during OpenFile and only read afterwards, so
-// concurrent ReadAt calls need no synchronisation of their own — as
-// io.ReaderAt requires. The one mutable field, closed, is atomic.
+// The cluster list and the size are settled at OpenFile and change only when a
+// write through this File extends or truncates it (see writeat.go), so mu — an
+// RWMutex — is held for reading by ReadAt and Size and for writing by WriteAt
+// and Truncate. Concurrent ReadAt calls therefore proceed in parallel, as
+// io.ReaderAt requires; concurrent writes are serialised, which is stricter
+// than io.WriterAt demands and never wrong. The one lock-free field, closed,
+// is atomic so a use-after-close is reported rather than raced on.
 type exfatFile struct {
 	fs *exfatFS
-	// clusters holds the file's chain in order: clusters[i] is the cluster
-	// number holding bytes [i*clusterSize, (i+1)*clusterSize).
+	// path is the file's path in the volume. It is kept because extending or
+	// truncating the file has to rewrite its Stream Extension entry — exFAT
+	// stores a file's length there and nowhere else — and there is no
+	// back-pointer from a cluster to the entry that owns it.
+	path string
+	// mu guards clusters, size and contiguous against a concurrent extend or
+	// truncate.
+	mu sync.RWMutex
+	// clusters holds the file's allocation in order: clusters[i] is the
+	// cluster number holding bytes [i*clusterSize, (i+1)*clusterSize).
 	clusters []uint32
+	// contiguous records that the entry carries NoFatChain: the clusters are
+	// a consecutive run and the FAT holds NOTHING for them. Reading is
+	// unaffected — clusters already lists them — but any change of length has
+	// to materialise a real chain first, because a grow cannot assume the
+	// cluster after the run is free.
+	contiguous bool
 	// size is the readable length in bytes: the directory entry's dataLength
 	// clamped to what the chain can actually address, so it always equals
 	// len(fs.ReadFile(path)) — a truncated or forged chain shortens the file
@@ -67,13 +86,25 @@ func (fs *exfatFS) OpenFile(path string) (filesystem.File, error) {
 	if entry.attr&exfatAttrDir != 0 {
 		return nil, fmt.Errorf("exfat: %q is not a regular file", path)
 	}
-	clusters, size, err := fs.chainClusters(entry.cluster, entry.size)
-	if err != nil {
-		return nil, err
+	// Which walk applies is the entry's to say: a NoFatChain entry owns a
+	// consecutive run whose FAT entries are zero, so walking the FAT for it
+	// would stop after one cluster and hand back a truncated file.
+	contiguous := entry.flags&exfatFlagNoFatChain != 0
+	var clusters []uint32
+	var size int64
+	if contiguous {
+		clusters, size = fs.contiguousClusters(entry.cluster, entry.size)
+	} else {
+		clusters, size, err = fs.chainClusters(entry.cluster, entry.size)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &exfatFile{
 		fs:          fs,
+		path:        path,
 		clusters:    clusters,
+		contiguous:  contiguous,
 		size:        size,
 		clusterSize: int64(fs.info.ClusterSize()),
 		dataBase:    fs.info.ClusterHeapOffsetBytes(fs.partOffset),
@@ -137,9 +168,15 @@ func (fs *exfatFS) chainClusters(start uint32, size uint64) ([]uint32, int64, er
 	return clusters, covered, nil
 }
 
-// Size returns the file's readable length in bytes, taken from the directory
-// entry read at OpenFile time and clamped to what the chain addresses. No I/O.
-func (f *exfatFile) Size() int64 { return f.size }
+// Size returns the file's readable length in bytes: the Stream Extension
+// entry's DataLength read at OpenFile, clamped to what the allocation
+// addresses, and then tracking every extend or truncate performed through this
+// File. No I/O.
+func (f *exfatFile) Size() int64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.size
+}
 
 // Close releases the File. exFAT files hold no per-file handle — the volume's
 // single descriptor stays owned by the Filesystem — so Close only marks the
@@ -171,6 +208,10 @@ func (f *exfatFile) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("exfat: ReadAt: negative offset %d", off)
 	}
+	// The read lock keeps a read from observing a half-applied extend; it is
+	// shared, so parallel ReadAt calls are not serialised against each other.
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if off >= f.size {
 		return 0, io.EOF
 	}

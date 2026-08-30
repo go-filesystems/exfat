@@ -18,6 +18,7 @@ Supports bare filesystem images and MBR/GPT partitioned disks, full directory tr
 | Format | ✅ | Creates exFAT images |
 | ReadFile | ✅ | Full file reads supported |
 | Read at an offset | ✅ | `OpenFile(path)` → `io.ReaderAt` + `Size()` (`filesystem.Opener` / `filesystem.File`) |
+| Write at an offset | ✅ | `OpenFile(path)` → `io.WriterAt` + `Truncate` + `Sync` (`filesystem.WritableFile`). Writes only the bytes given; a length change materialises a `NoFatChain` run into a real FAT chain first |
 | WriteFile | ✅ | Full file writes supported |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | ReadLink / Symlinks | ⚠️ No | exFAT does not support POSIX symlinks |
@@ -48,6 +49,7 @@ github.com/go-filesystems/exfat
 | ListDir      | ✅ implemented |
 | ReadFile     | ✅ implemented |
 | OpenFile     | ✅ implemented (`filesystem.Opener`) |
+| WriteAt      | ✅ implemented (`filesystem.WritableFile`, on the `File`) |
 | WriteFile    | ✅ implemented |
 | MkDir        | ✅ implemented |
 | DeleteFile   | ✅ implemented |
@@ -99,6 +101,17 @@ if o, ok := fs.(filesystem.Opener); ok {
     n, err := f.ReadAt(buf, 1<<30) // io.ReaderAt semantics, exactly
     _, _ = n, err
     _ = f.Size()                   // from metadata; reads nothing
+
+    // ...and write part of one, in place. Without this a positional write can
+    // only be ReadFile + splice + WriteFile: the whole file read, reallocated
+    // and written back on every request, so writing a file in blocks is
+    // quadratic. Measured over a real Linux kernel NFS mount, 8 MiB in 64 KiB
+    // blocks took 31 s (269 kB/s) that way, against 1.5 s with this.
+    if w, ok := f.(filesystem.WritableFile); ok {
+        _, err = w.WriteAt(buf, 1<<30) // io.WriterAt semantics, exactly
+        _ = w.Truncate(1 << 20)        // grow zero-fills; shrink frees clusters
+        _ = w.Sync()                   // fsync(2) on a file-backed image
+    }
 }
 if l, ok := fs.(filesystem.Labeller); ok {
     _ = l.SetLabel("MYVOL")
