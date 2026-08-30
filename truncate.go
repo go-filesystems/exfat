@@ -54,8 +54,11 @@ func (fs *exfatFS) Truncate(path string, newSize int64) error {
 
 	// Read the current contents (bounded by the old size), then build the
 	// new body: the truncated prefix for shrink, or the existing bytes
-	// followed by implicit zero-fill for grow.
-	old, err := fs.readClusterChain(oldCluster, oldSize)
+	// followed by implicit zero-fill for grow. The read goes through
+	// readEntryData rather than readClusterChain because the source may be a
+	// NoFatChain (consecutive, FAT-less) allocation, whose chain walk would
+	// stop after one cluster and silently truncate the file this rewrites.
+	old, err := fs.readEntryData(rootDirEntry{cluster: oldCluster, size: oldSize, flags: stream[1]})
 	if err != nil {
 		return err
 	}

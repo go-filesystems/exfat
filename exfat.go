@@ -25,11 +25,17 @@ const (
 	exfatEntryName    = 0xC1
 	exfatAttrReadOnly = 0x01
 	exfatAttrDir      = 0x10
-	nameCharsPerEntry = 15
-	exfatModeDir      = 0o040755
-	exfatModeDirRO    = 0o040555
-	exfatModeFile     = 0o100644
-	exfatModeFileRO   = 0o100444
+	// GeneralSecondaryFlags, in the Stream Extension entry's second byte.
+	// AllocationPossible says the entry owns a cluster allocation at all;
+	// NoFatChain says that allocation is a CONSECUTIVE run and that the FAT
+	// holds nothing for it, so the chain must not be walked.
+	exfatFlagAllocPossible = 0x01
+	exfatFlagNoFatChain    = 0x02
+	nameCharsPerEntry      = 15
+	exfatModeDir           = 0o040755
+	exfatModeDirRO         = 0o040555
+	exfatModeFile          = 0o100644
+	exfatModeFileRO        = 0o100444
 )
 
 type rootDirEntry struct {
@@ -37,6 +43,10 @@ type rootDirEntry struct {
 	attr    uint16
 	cluster uint32
 	size    uint64
+	// flags is the Stream Extension entry's GeneralSecondaryFlags byte. Its
+	// NoFatChain bit decides how the entry's clusters are addressed, so every
+	// path that turns an entry into bytes has to carry it.
+	flags uint8
 }
 
 // Info holds the fields decoded from the exFAT main boot sector.
@@ -222,7 +232,7 @@ func (fs *exfatFS) ReadFile(path string) ([]byte, error) {
 	if entry.attr&exfatAttrDir != 0 {
 		return nil, fmt.Errorf("exfat: %q is not a regular file", path)
 	}
-	return fs.readClusterChain(entry.cluster, entry.size)
+	return fs.readEntryData(entry)
 }
 
 // WriteFile creates or overwrites the regular file at path with data and permission bits.
@@ -687,7 +697,7 @@ func parseRootDirMetadata(buf []byte) ([]rootDirEntry, error) {
 		firstCluster := le.Uint32(stream[20:24])
 		dataLength := le.Uint64(stream[24:32])
 		name := string(utf16.Decode(nameWords[:nameLen]))
-		entries = append(entries, rootDirEntry{name: name, attr: attrs, cluster: firstCluster, size: dataLength})
+		entries = append(entries, rootDirEntry{name: name, attr: attrs, cluster: firstCluster, size: dataLength, flags: stream[1]})
 		offset += secondaryCount * dirEntrySize
 	}
 	return entries, nil
@@ -931,6 +941,82 @@ func (fs *exfatFS) readClusterChain(start uint32, size uint64) ([]byte, error) {
 	return buf, nil
 }
 
+// readEntryData returns the contents of the regular file described by entry,
+// addressing its clusters the way the entry itself says they are laid out.
+//
+// exFAT has TWO ways to own an allocation, and only one of them is a FAT chain.
+// A Stream Extension entry may set NoFatChain (GeneralSecondaryFlags bit 1) to
+// declare that its clusters are CONSECUTIVE and that the FAT holds nothing for
+// them — the entries for those clusters read as zero, exactly like free space.
+// Walking the FAT for such a file therefore stops after its FIRST cluster and
+// silently returns a truncated file; that is not a hypothetical, it is what the
+// canonical formatters do (every file in this package's own newfs_exfat fixture
+// has NoFatChain set), and it only stays invisible while such files fit in one
+// cluster.
+//
+// Splitting the decision here — rather than inside readClusterChain — keeps the
+// hardened chain walk exactly as it was for everything that really is a chain,
+// and gives the contiguous case a walk that needs no FAT reads at all.
+func (fs *exfatFS) readEntryData(entry rootDirEntry) ([]byte, error) {
+	if entry.flags&exfatFlagNoFatChain == 0 {
+		return fs.readClusterChain(entry.cluster, entry.size)
+	}
+	return fs.readContiguousRun(entry.cluster, entry.size)
+}
+
+// readContiguousRun reads up to size bytes from the consecutive cluster run
+// starting at start. It is the NoFatChain counterpart of readClusterChain and
+// is bounded the same way: contiguousClusters clamps an attacker-controlled
+// dataLength to the heap's real capacity AND to the clusters that actually
+// exist past start, so a forged entry yields a short read rather than an
+// enormous allocation or a read outside the image.
+func (fs *exfatFS) readContiguousRun(start uint32, size uint64) ([]byte, error) {
+	clusters, covered := fs.contiguousClusters(start, size)
+	clusterSize := int64(fs.info.ClusterSize())
+	dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
+	buf := make([]byte, 0, covered)
+	for _, c := range clusters {
+		clusterBuf := make([]byte, clusterSize)
+		if _, err := fs.f.ReadAt(clusterBuf, dataBase+int64(c-2)*clusterSize); err != nil {
+			return nil, fmt.Errorf("exfat: read cluster %d: %w", c, err)
+		}
+		buf = append(buf, clusterBuf...)
+	}
+	if int64(len(buf)) > covered {
+		buf = buf[:covered]
+	}
+	return buf, nil
+}
+
+// contiguousClusters returns the cluster numbers of a NoFatChain run holding
+// up to size bytes from start, plus the number of bytes they address.
+//
+// There is no chain to walk and therefore no cycle to guard against, but the
+// declared length is still attacker-controlled, so it is clamped twice: to the
+// heap's total capacity, and to the clusters that exist between start and the
+// last cluster the heap has. Both clamps shorten the file, which is the same
+// outcome the chain walk produces for a chain that ends early — a truncated
+// image reads short instead of inventing bytes.
+func (fs *exfatFS) contiguousClusters(start uint32, size uint64) ([]uint32, int64) {
+	lastCluster := uint64(fs.info.ClusterCount) + 1
+	if start < 2 || uint64(start) > lastCluster {
+		return nil, 0
+	}
+	clusterSize := uint64(fs.info.ClusterSize())
+	if capBytes := fs.maxChainBytes(); size > capBytes {
+		size = capBytes
+	}
+	if avail := (lastCluster - uint64(start) + 1) * clusterSize; size > avail {
+		size = avail
+	}
+	n := (size + clusterSize - 1) / clusterSize
+	clusters := make([]uint32, n)
+	for i := range clusters {
+		clusters[i] = start + uint32(i)
+	}
+	return clusters, int64(size)
+}
+
 // writeData allocates FAT clusters, writes data into them, and returns the first cluster.
 func (fs *exfatFS) writeData(data []byte) (uint32, error) {
 	clusterSize := int64(fs.info.ClusterSize())
@@ -975,24 +1061,26 @@ func (fs *exfatFS) writeData(data []byte) (uint32, error) {
 	return allocated[0], nil
 }
 
-// allocCluster scans the FAT and returns the first free cluster number (≥ 2).
-// When the Allocation Bitmap was located by Open, the cluster is also marked
-// as allocated in the bitmap so the FAT and bitmap stay consistent.
+// allocCluster returns one free cluster number (≥ 2), marked as allocated in
+// the Allocation Bitmap when the volume has one.
+//
+// It used to scan the FAT itself, four bytes per candidate cluster, restarting
+// from cluster 2 on every call: allocating k clusters cost O(k · clusterCount)
+// reads. It now delegates to allocClusterRun, which reads a page of FAT at a
+// time — and, decisively, consults the Allocation Bitmap as well. On exFAT the
+// bitmap is the authority on what is free; a NoFatChain file's FAT entries are
+// ZERO, so a FAT-only scan happily hands out clusters that a canonical
+// formatter's files are sitting in. Every file in the newfs_exfat fixture is
+// NoFatChain, so that was not a theoretical corruption.
 func (fs *exfatFS) allocCluster() (uint32, error) {
-	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
-	var buf [4]byte
-	for c := uint32(2); c < fs.info.ClusterCount+2; c++ {
-		if _, err := fs.f.ReadAt(buf[:], fatBase+int64(c)*4); err != nil {
-			return 0, fmt.Errorf("exfat: read FAT entry: %w", err)
-		}
-		if binary.LittleEndian.Uint32(buf[:]) == 0 {
-			if err := fs.setBitmapBit(c, true); err != nil {
-				return 0, err
-			}
-			return c, nil
-		}
+	run, err := fs.allocClusterRun(1)
+	if err != nil {
+		return 0, err
 	}
-	return 0, fmt.Errorf("exfat: no free clusters")
+	if err := fs.setBitmapBit(run[0], true); err != nil {
+		return 0, err
+	}
+	return run[0], nil
 }
 
 // setBitmapBit toggles the bitmap bit corresponding to cluster c. The
