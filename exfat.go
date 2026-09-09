@@ -138,9 +138,21 @@ func Open(imagePath string, partIndex int) (filesystem.Filesystem, error) {
 		f.Close()
 		return nil, err
 	}
-	info, err := openReadInfo(f, off)
+	fs, err := openAt(f, off)
 	if err != nil {
 		f.Close()
+		return nil, err
+	}
+	return fs, nil
+}
+
+// openAt reads the filesystem that starts at off, whatever the caller opened.
+// It is the whole of Open after the file and the partition are settled, and it
+// is shared with OpenReader so the two cannot drift: everything below --- the
+// label, the allocation bitmap --- would otherwise have to be remembered twice.
+func openAt(f diskRW, off int64) (filesystem.Filesystem, error) {
+	info, err := openReadInfo(f, off)
+	if err != nil {
 		return nil, err
 	}
 	fs := &exfatFS{f: f, partOffset: off, info: info}
