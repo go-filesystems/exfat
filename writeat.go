@@ -3,6 +3,7 @@ package filesystem_exfat
 import (
 	"encoding/binary"
 	"fmt"
+	iofs "io/fs"
 	"os"
 
 	filesystem "github.com/go-filesystems/interface"
@@ -495,7 +496,7 @@ func (fs *exfatFS) setStreamExtent(path string, firstCluster uint32, size int64)
 	}
 	entryOff, secondaryCount := exfatFindEntry(buf, name)
 	if entryOff < 0 {
-		return fmt.Errorf("exfat: %q not found", path)
+		return fmt.Errorf("exfat: %q not found: %w", path, iofs.ErrNotExist)
 	}
 	stream := buf[entryOff+dirEntrySize : entryOff+2*dirEntrySize]
 	le := binary.LittleEndian

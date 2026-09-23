@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"math"
 	"os"
 	"strings"
@@ -348,7 +349,7 @@ func (fs *exfatFS) DeleteFile(path string) error {
 	}
 	entryOff, entrySec := exfatFindEntry(rootBuf, name)
 	if entryOff < 0 {
-		return fmt.Errorf("exfat: %q not found", path)
+		return fmt.Errorf("exfat: %q not found: %w", path, iofs.ErrNotExist)
 	}
 	attrs := binary.LittleEndian.Uint16(rootBuf[entryOff+4 : entryOff+6])
 	if attrs&uint16(exfatAttrDir) != 0 {
@@ -420,7 +421,7 @@ func (fs *exfatFS) DeleteDir(path string) error {
 	}
 	entryOff, entrySec := exfatFindEntry(rootBuf, name)
 	if entryOff < 0 {
-		return fmt.Errorf("exfat: %q not found", path)
+		return fmt.Errorf("exfat: %q not found: %w", path, iofs.ErrNotExist)
 	}
 	attrs := binary.LittleEndian.Uint16(rootBuf[entryOff+4 : entryOff+6])
 	if attrs&uint16(exfatAttrDir) == 0 {
@@ -461,7 +462,7 @@ func (fs *exfatFS) Rename(oldPath, newPath string) error {
 	}
 	oldOff, oldSec := exfatFindEntry(oldBuf, oldName)
 	if oldOff < 0 {
-		return fmt.Errorf("exfat: %q not found", oldPath)
+		return fmt.Errorf("exfat: %q not found: %w", oldPath, iofs.ErrNotExist)
 	}
 	oldAttrs := binary.LittleEndian.Uint16(oldBuf[oldOff+4 : oldOff+6])
 	oldStream := oldBuf[oldOff+dirEntrySize : oldOff+2*dirEntrySize]
@@ -837,7 +838,7 @@ func (fs *exfatFS) resolvePath(path string) (rootDirEntry, uint32, error) {
 			}
 		}
 		if !found {
-			return rootDirEntry{}, 0, fmt.Errorf("exfat: %q not found", path)
+			return rootDirEntry{}, 0, fmt.Errorf("exfat: %q not found: %w", path, iofs.ErrNotExist)
 		}
 	}
 	return result, parentCluster, nil
