@@ -181,8 +181,8 @@ func openAt(f diskRW, off int64) (filesystem.Filesystem, error) {
 // might omit it — by returning (0, 0, nil).
 func findBitmap(rd diskRW, info Info, partOffset int64) (uint32, uint64, error) {
 	off := info.RootDirOffset(partOffset)
-	buf := make([]byte, info.ClusterSize())
-	if _, err := rd.ReadAt(buf, off); err != nil {
+	buf, err := readBacked(rd, off, int64(info.ClusterSize()))
+	if err != nil {
 		return 0, 0, fmt.Errorf("exfat: read root directory: %w", err)
 	}
 	le := binary.LittleEndian
@@ -614,6 +614,81 @@ func readerSize(r io.ReaderAt) int64 {
 	return math.MaxInt64
 }
 
+// maxDirBytes is the largest a directory can be: 8388608 directory entries of
+// 32 bytes, i.e. 256 MiB (Linux fs/exfat/exfat_raw.h MAX_EXFAT_DENTRIES). The
+// old bound was 256 clusters, which with 32 MiB clusters is 8 GiB.
+const maxDirBytes = 8388608 * dirEntrySize
+
+// probeSize finds the length of r by asking whether single bytes exist: an
+// exponential search for the first absent power of two, then a bisection. It
+// costs about 2*log2(size) one-byte reads and needs no Size or Stat method, so
+// it works for any io.ReaderAt. A byte is present only when ReadAt returns it:
+// a reader that reports (0, nil) past its end is absent too.
+func probeSize(r io.ReaderAt) int64 {
+	// Only a definite end (io.EOF, or nothing and no error) means "absent". Any
+	// other error is a fault in the device, which says nothing about where the
+	// image ends: count the byte as present and let the real read report it.
+	has := func(off int64) bool {
+		var b [1]byte
+		n, err := r.ReadAt(b[:], off)
+		if n == 1 {
+			return true
+		}
+		return err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF)
+	}
+	if !has(0) {
+		return 0
+	}
+	hi := int64(1)
+	for hi < 1<<62 && has(hi) {
+		hi <<= 1
+	}
+	lo := hi >> 1
+	for lo+1 < hi {
+		mid := lo + (hi-lo)/2
+		if has(mid) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return lo + 1
+}
+
+// deviceSize reports how many bytes the image behind the volume really holds:
+// what bounds anything the boot sector or a directory entry merely claims.
+func (fs *exfatFS) deviceSize() int64 {
+	if n := readerSize(fs.f); n != math.MaxInt64 {
+		return n
+	}
+	return probeSize(fs.f)
+}
+
+// readBacked reads n bytes at off, allocating the buffer only after proving
+// that the last of them exists. n is a cluster size taken from the boot sector
+// (up to 32 MiB) and make-then-ReadAt reserved it for an image of any size: a
+// 512-byte file declaring 32 MiB clusters cost 64 MiB just to Open.
+func readBacked(r io.ReaderAt, off, n int64) ([]byte, error) {
+	if n <= 0 {
+		return []byte{}, nil
+	}
+	if off < 0 || off > math.MaxInt64-n {
+		return nil, fmt.Errorf("exfat: %d bytes at offset %d overflow", n, off)
+	}
+	var probe [1]byte
+	if m, err := r.ReadAt(probe[:], off+n-1); m != 1 {
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("exfat: %d bytes at offset %d lie past the end of the image", n, off)
+	}
+	buf := make([]byte, n)
+	if m, err := r.ReadAt(buf, off); err != nil && m != len(buf) {
+		return nil, err
+	}
+	return buf, nil
+}
+
 // partitionOffset locates the byte offset of the selected partition, hardened
 // against malicious/corrupt partition tables via go-volumes/gpt.
 //
@@ -756,6 +831,9 @@ func pathComponents(path string) []string {
 func (fs *exfatFS) readDirBuf(startCluster uint32) ([]byte, error) {
 	const maxDirClusters = 256
 	maxBytes := uint64(maxDirClusters) * fs.info.ClusterSize()
+	if maxBytes > maxDirBytes {
+		maxBytes = maxDirBytes
+	}
 	return fs.readClusterChain(startCluster, maxBytes)
 }
 
@@ -932,9 +1010,9 @@ func (fs *exfatFS) readClusterChain(start uint32, size uint64) ([]byte, error) {
 		if err := seen.Check(uint64(cluster)); err != nil {
 			return nil, fmt.Errorf("exfat: cluster chain from %d: %w", start, err)
 		}
-		clusterBuf := make([]byte, clusterSize)
 		off := dataBase + int64(cluster-2)*clusterSize
-		if _, err := fs.f.ReadAt(clusterBuf, off); err != nil {
+		clusterBuf, err := readBacked(fs.f, off, clusterSize)
+		if err != nil {
 			return nil, fmt.Errorf("exfat: read cluster %d: %w", cluster, err)
 		}
 		buf = append(buf, clusterBuf...)
@@ -989,8 +1067,8 @@ func (fs *exfatFS) readContiguousRun(start uint32, size uint64) ([]byte, error) 
 	dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
 	buf := make([]byte, 0, covered)
 	for _, c := range clusters {
-		clusterBuf := make([]byte, clusterSize)
-		if _, err := fs.f.ReadAt(clusterBuf, dataBase+int64(c-2)*clusterSize); err != nil {
+		clusterBuf, err := readBacked(fs.f, dataBase+int64(c-2)*clusterSize, clusterSize)
+		if err != nil {
 			return nil, fmt.Errorf("exfat: read cluster %d: %w", c, err)
 		}
 		buf = append(buf, clusterBuf...)
@@ -1021,6 +1099,17 @@ func (fs *exfatFS) contiguousClusters(start uint32, size uint64) ([]uint32, int6
 	}
 	if avail := (lastCluster - uint64(start) + 1) * clusterSize; size > avail {
 		size = avail
+	}
+	// The declared run is a claim; the image is what can back it. Without this
+	// a boot sector declaring 2^32 clusters and a NoFatChain entry declaring
+	// them all turned two small structures into make([]uint32, 2^31) -- 8 GiB
+	// for the cluster list, and a TiB-sized result buffer behind it.
+	dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
+	first := dataBase + int64(start-2)*int64(clusterSize)
+	if present := fs.deviceSize() - first; present <= 0 {
+		return nil, 0
+	} else if uint64(present) < size {
+		size = uint64(present)
 	}
 	n := (size + clusterSize - 1) / clusterSize
 	clusters := make([]uint32, n)

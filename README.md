@@ -27,6 +27,28 @@ Supports bare filesystem images and MBR/GPT partitioned disks, full directory tr
 | Grow / Shrink / Resize | ✅ | Format provisions FAT headroom so `Grow` doesn't immediately need relocation |
 | Partitioned images | ✅ | MBR/GPT supported |
 
+## Untrusted input
+
+An image is attacker-controlled data. Every allocation a value in the image can
+size is bounded before it happens, and a hostile image gets an error, not an
+out-of-memory kill:
+
+- a cluster buffer is allocated only after the cluster's last byte has been
+  read: a 512-byte file whose boot sector declares 32 MiB clusters no longer
+  costs 64 MiB to `Open`;
+- a `NoFatChain` (contiguous) run is bounded by the bytes the image really
+  holds, not by `ClusterCount` and the entry's `DataLength`, so two small
+  claims cannot size a multi-gigabyte cluster list;
+- a directory is at most 256 MiB (8388608 entries of 32 bytes, Linux
+  `MAX_EXFAT_DENTRIES`), not 256 clusters of up to 32 MiB;
+- an allocation bitmap larger than the image is refused.
+
+When the reader cannot say how long it is, the length is found by probing
+single bytes (about `2*log2(size)` reads).
+
+`FuzzOpenAndWalk` drives the read surface; the regression tests are in
+`bombs_test.go`.
+
 ## Limitations
 
 - exFAT does not support POSIX symlinks or POSIX permissions/ACLs.
