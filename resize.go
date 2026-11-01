@@ -266,6 +266,14 @@ func (fs *exfatFS) assertNoAllocBeyondViaBitmap(newClusterCount uint32) error {
 // error — the caller has already vetted the requested range against
 // fs.bitmapLength.
 func (fs *exfatFS) readBitmapBytes(start, n uint64) ([]byte, error) {
+	// n derives from the bitmap length the root directory claims. A bitmap cannot
+	// be bigger than the image that holds it, so check that before it sizes a
+	// buffer.
+	// (A megabyte is always affordable, so the question -- which costs reads to
+	// answer on a reader that cannot say its size -- is only asked beyond that.)
+	if n > 1<<20 && n > uint64(fs.deviceSize()) {
+		return nil, fmt.Errorf("exfat: allocation bitmap of %d bytes is larger than the image", n)
+	}
 	out := make([]byte, n)
 	if n == 0 {
 		return out, nil

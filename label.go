@@ -114,8 +114,8 @@ func (fs *exfatFS) SetLabel(label string) error {
 func readVolumeLabel(rd diskRW, info Info, partOffset int64) (string, error) {
 	clusterSize := info.ClusterSize()
 	off := info.RootDirOffset(partOffset)
-	buf := make([]byte, clusterSize)
-	if _, err := rd.ReadAt(buf, off); err != nil {
+	buf, err := readBacked(rd, off, int64(clusterSize))
+	if err != nil {
 		return "", fmt.Errorf("exfat: read root directory: %w", err)
 	}
 	for offset := 0; offset+dirEntrySize <= len(buf); offset += dirEntrySize {
