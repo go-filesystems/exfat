@@ -48,6 +48,9 @@ type rootDirEntry struct {
 	// NoFatChain bit decides how the entry's clusters are addressed, so every
 	// path that turns an entry into bytes has to carry it.
 	flags uint8
+	// times is bytes 8..24 of the File directory entry: the three timestamps,
+	// the two 10 ms increments and the three UTC offsets (spec 7.4).
+	times [17]byte
 }
 
 // Info holds the fields decoded from the exFAT main boot sector.
@@ -785,7 +788,9 @@ func parseRootDirMetadata(buf []byte) ([]rootDirEntry, error) {
 		firstCluster := le.Uint32(stream[20:24])
 		dataLength := le.Uint64(stream[24:32])
 		name := string(utf16.Decode(nameWords[:nameLen]))
-		entries = append(entries, rootDirEntry{name: name, attr: attrs, cluster: firstCluster, size: dataLength, flags: stream[1]})
+		re := rootDirEntry{name: name, attr: attrs, cluster: firstCluster, size: dataLength, flags: stream[1]}
+		copy(re.times[:], entry[8:25])
+		entries = append(entries, re)
 		offset += secondaryCount * dirEntrySize
 	}
 	return entries, nil

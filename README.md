@@ -135,6 +135,15 @@ if o, ok := fs.(filesystem.Opener); ok {
         _ = w.Sync()                   // fsync(2) on a file-backed image
     }
 }
+// Recorded timestamps (filesystem.TimesReader, interface v0.6.0): Btime and
+// Mtime at 10 ms, Atime at 2 s, each read with its own UTC-offset byte (a
+// clear OffsetValid bit reads as time.Local, as the exFAT spec says). Ctime is
+// not recorded by exFAT and stays the zero Timestamp, as does any field that
+// does not decode to a real date.
+if tr, ok := fs.(filesystem.TimesReader); ok {
+    ft, _ := tr.Times("/big.bin")
+    _ = ft.Mtime.Or(time.Now())
+}
 if l, ok := fs.(filesystem.Labeller); ok {
     _ = l.SetLabel("MYVOL")
 }
