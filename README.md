@@ -144,6 +144,18 @@ if tr, ok := fs.(filesystem.TimesReader); ok {
     ft, _ := tr.Times("/big.bin")
     _ = ft.Mtime.Or(time.Now())
 }
+// Set the access and modification times (a zero time leaves a field alone).
+// Written as local wall clock with OffsetValid and the local UtcOffset (UTC
+// when that offset is not a 15-minute step); mtime to 10 ms, atime to 2 s,
+// both rounded down; the create time is untouched; the entry-set checksum is
+// recomputed. A year outside 1980-2107 is a *TimeRangeError
+// (errors.Is(err, ErrTimeOutOfRange)) and nothing is written. The driver has
+// no Chmod/Chown, so it is not a full filesystem.MetadataSetter.
+if c, ok := fs.(interface {
+    Chtimes(path string, atime, mtime time.Time) error
+}); ok {
+    _ = c.Chtimes("/big.bin", time.Now(), time.Now())
+}
 if l, ok := fs.(filesystem.Labeller); ok {
     _ = l.SetLabel("MYVOL")
 }
