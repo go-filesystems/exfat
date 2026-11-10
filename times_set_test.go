@@ -49,6 +49,35 @@ func formatChtimes(t *testing.T) (chtimesFS, string) {
 	return fs.(chtimesFS), img
 }
 
+// TestMetadataSetter: the driver satisfies the whole interface (the assertion
+// smb's SET_INFO path, go-fileshare's lock wrapper, NFS and SFTP make), and
+// Chmod and Chown refuse with a typed error and change nothing.
+func TestMetadataSetter(t *testing.T) {
+	fs, _ := formatChtimes(t)
+	defer fs.Close()
+	var f filesystem.Filesystem = fs
+	ms, ok := f.(filesystem.MetadataSetter)
+	if !ok {
+		t.Fatal("exfat is not a filesystem.MetadataSetter")
+	}
+	before, _ := fs.Times("/A.TXT")
+	for name, err := range map[string]error{
+		"Chmod": ms.Chmod("/A.TXT", 0o600),
+		"Chown": ms.Chown("/A.TXT", 1, 2),
+	} {
+		if !errors.Is(err, ErrNotSupported) || !errors.Is(err, errors.ErrUnsupported) {
+			t.Errorf("%s = %v, want ErrNotSupported (wrapping errors.ErrUnsupported)", name, err)
+		}
+	}
+	if after, _ := fs.Times("/A.TXT"); after != before {
+		t.Error("a refused Chmod/Chown changed the entry")
+	}
+	now := time.Now()
+	if err := ms.Chtimes("/A.TXT", now, now); err != nil {
+		t.Fatalf("Chtimes through the interface: %v", err)
+	}
+}
+
 func timesOf(t *testing.T, fs chtimesFS, p string) (a, m time.Time) {
 	t.Helper()
 	ft, err := fs.Times(p)

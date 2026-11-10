@@ -5,15 +5,26 @@ import (
 	"errors"
 	"fmt"
 	iofs "io/fs"
+	"os"
 	"time"
+
+	filesystem "github.com/go-filesystems/interface"
 )
 
-// The driver has Chtimes but not Chmod or Chown (exFAT has no owner, and the
-// attribute bits are a separate change), so it does not satisfy the bundled
-// filesystem.MetadataSetter; callers probe for the single method.
-var _ interface {
-	Chtimes(path string, atime, mtime time.Time) error
-} = (*exfatFS)(nil)
+var _ filesystem.MetadataSetter = (*exfatFS)(nil)
+
+// ErrNotSupported is what Chmod and Chown return: exFAT records no owner and no
+// POSIX mode bits (only the read-only, hidden, system and archive attributes),
+// so there is nothing to store. It wraps errors.ErrUnsupported.
+var ErrNotSupported = fmt.Errorf("exfat: the format has no POSIX mode bits or owners: %w", errors.ErrUnsupported)
+
+// Chmod is part of filesystem.MetadataSetter, which the SMB, NFS and SFTP
+// servers probe for as a whole before they use Chtimes. exFAT has no mode bits
+// to replace, so it always returns ErrNotSupported and writes nothing.
+func (fs *exfatFS) Chmod(path string, perm os.FileMode) error { return ErrNotSupported }
+
+// Chown returns ErrNotSupported: exFAT records no owner. See Chmod.
+func (fs *exfatFS) Chown(path string, uid, gid uint32) error { return ErrNotSupported }
 
 // ErrTimeOutOfRange is what Chtimes returns, wrapped in a *TimeRangeError, for
 // a time the exFAT Timestamp field cannot hold: a 7-bit year counted from 1980,

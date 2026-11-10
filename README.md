@@ -149,11 +149,10 @@ if tr, ok := fs.(filesystem.TimesReader); ok {
 // when that offset is not a 15-minute step); mtime to 10 ms, atime to 2 s,
 // both rounded down; the create time is untouched; the entry-set checksum is
 // recomputed. A year outside 1980-2107 is a *TimeRangeError
-// (errors.Is(err, ErrTimeOutOfRange)) and nothing is written. The driver has
-// no Chmod/Chown, so it is not a full filesystem.MetadataSetter.
-if c, ok := fs.(interface {
-    Chtimes(path string, atime, mtime time.Time) error
-}); ok {
+// (errors.Is(err, ErrTimeOutOfRange)) and nothing is written. The driver is a
+// filesystem.MetadataSetter; Chmod and Chown return ErrNotSupported (wraps
+// errors.ErrUnsupported): exFAT has no mode bits or owners.
+if c, ok := fs.(filesystem.MetadataSetter); ok {
     _ = c.Chtimes("/big.bin", time.Now(), time.Now())
 }
 if l, ok := fs.(filesystem.Labeller); ok {
