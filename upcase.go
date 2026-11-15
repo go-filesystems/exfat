@@ -21,29 +21,46 @@ func (fs *exfatFS) loadUpcase() []uint16 {
 	if fs.upcase != nil {
 		return fs.upcase
 	}
-	tbl := identityUpcase()
-	fs.upcase = tbl
+	// Without a usable table the kernel loads its own default one, which folds
+	// at least ASCII and Latin-1: use that, and do not cache a failed read.
 	root, err := fs.readDirBuf(fs.info.RootDirectoryCluster)
 	if err != nil {
-		return tbl
+		return fallbackUpcase()
 	}
-	for off := 0; off+dirEntrySize <= len(root); off += dirEntrySize {
+	for off := 0; off+dirEntrySize <= len(root) && root[off] != 0x00; off += dirEntrySize {
 		if root[off] != 0x82 {
 			continue
 		}
 		cluster := binary.LittleEndian.Uint32(root[off+20:])
 		size := binary.LittleEndian.Uint64(root[off+24:])
 		if cluster < 2 || size == 0 || size > 1<<17 {
-			return tbl
+			break
 		}
 		raw, err := fs.readContiguousRun(cluster, size)
 		if err != nil || len(raw) < 2 {
-			return tbl
+			return fallbackUpcase()
 		}
 		fs.upcase = decodeUpcase(raw)
-		break
+		return fs.upcase
 	}
+	fs.upcase = fallbackUpcase() // no table on the volume: stable, cache it
 	return fs.upcase
+}
+
+// fallbackUpcase folds ASCII and Latin-1 letters, the part of the kernel's
+// default table every volume is certain to share.
+func fallbackUpcase() []uint16 {
+	t := identityUpcase()
+	for c := 'a'; c <= 'z'; c++ {
+		t[c] = uint16(c - 32)
+	}
+	for c := 0xE0; c <= 0xFE; c++ {
+		if c != 0xF7 {
+			t[c] = uint16(c - 32)
+		}
+	}
+	t[0xFF] = 0x178
+	return t
 }
 
 func identityUpcase() []uint16 {
@@ -59,7 +76,14 @@ func decodeUpcase(raw []byte) []uint16 {
 	idx := 0
 	for i := 0; i+2 <= len(raw) && idx < len(t); i += 2 {
 		v := binary.LittleEndian.Uint16(raw[i:])
-		if v == 0xFFFF && i+4 <= len(raw) {
+		if v == uint16(idx) {
+			idx++ // identity entry, tested first as the kernel does
+			continue
+		}
+		if v == 0xFFFF {
+			if i+4 > len(raw) {
+				break // a trailing 0xFFFF ends the table
+			}
 			idx += int(binary.LittleEndian.Uint16(raw[i+2:]))
 			i += 2
 			continue

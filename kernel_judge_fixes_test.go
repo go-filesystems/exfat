@@ -86,3 +86,50 @@ func TestNameHashFollowsTheVolumeTable(t *testing.T) {
 		t.Error("a table that maps é to É did not change the hash")
 	}
 }
+
+func TestWrittenHashUsesTheVolumeTableOnEveryPath(t *testing.T) {
+	f, err := Format(filepath.Join(t.TempDir(), "a.img"), 64<<20, FormatConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fs := f.(*exfatFS)
+	tbl := fallbackUpcase()
+	tbl[0xE9] = 0xC9 // pretend the volume folds é to É
+	fs.upcase = tbl
+	hashOnDisk := func(name string) uint16 {
+		root, err := fs.readDirBuf(fs.info.RootDirectoryCluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		off, _ := exfatFindEntry(root, name)
+		if off < 0 {
+			t.Fatalf("%s not found", name)
+		}
+		return binary.LittleEndian.Uint16(root[off+dirEntrySize+4:])
+	}
+	if err := f.WriteFile("/é.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.MkDir("/éd", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Rename("/é.txt", "/é2.txt"); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"é2.txt", "éd"} {
+		if got, want := hashOnDisk(name), hashWithTable(name, tbl); got != want {
+			t.Errorf("%s: on-disk hash %#x, want %#x under the volume table", name, got, want)
+		}
+	}
+}
+
+func TestMissingTableFallsBackToTheKernelsFolding(t *testing.T) {
+	tbl := fallbackUpcase()
+	if tbl['a'] != 'A' || tbl[0xE9] != 0xC9 || tbl[0xF7] != 0xF7 || tbl['1'] != '1' {
+		t.Fatal("the fallback table does not fold ASCII and Latin-1")
+	}
+	if got := decodeUpcase([]byte{0xFF, 0xFF}); got[0xFFFF] != 0xFFFF || got[5] != 5 {
+		t.Error("a trailing 0xFFFF changed the table")
+	}
+}
