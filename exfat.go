@@ -120,6 +120,8 @@ type exfatFS struct {
 	// older / minimal images that this driver also tolerates reading).
 	bitmapCluster uint32
 	bitmapLength  uint64
+	// upcase is the volume's Up-case Table, loaded on the first write.
+	upcase []uint16
 }
 
 var (
@@ -292,7 +294,7 @@ func (fs *exfatFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 	if perm&0o200 == 0 {
 		attrs |= uint16(exfatAttrReadOnly)
 	}
-	copy(rootBuf[freeOff:], makeExFATEntrySet(name, attrs, firstCluster, uint64(len(data))))
+	copy(rootBuf[freeOff:], fs.entrySet(name, attrs, firstCluster, uint64(len(data))))
 	return fs.writeDirBuf(parentCluster, rootBuf)
 }
 
@@ -336,7 +338,10 @@ func (fs *exfatFS) MkDir(path string, perm os.FileMode) error {
 	if perm&0o200 == 0 {
 		attrs |= uint16(exfatAttrReadOnly)
 	}
-	copy(rootBuf[freeOff:], makeExFATEntrySet(name, attrs, cluster, 0))
+	// A directory's DataLength is its allocation, one cluster here (directories
+	// do not grow): the Linux driver reads a size-0 directory as empty and
+	// fsck.exfat reports "size 0, but the first cluster ..." (#35).
+	copy(rootBuf[freeOff:], fs.entrySet(name, attrs, cluster, uint64(fs.info.ClusterSize())))
 	return fs.writeDirBuf(parentCluster, rootBuf)
 }
 
@@ -508,7 +513,7 @@ func (fs *exfatFS) Rename(oldPath, newPath string) error {
 		if freeOff < 0 {
 			return fmt.Errorf("exfat: directory is full")
 		}
-		copy(oldBuf[freeOff:], makeExFATEntrySet(newName, oldAttrs, oldCluster, oldSize))
+		copy(oldBuf[freeOff:], fs.entrySet(newName, oldAttrs, oldCluster, oldSize))
 		return fs.writeDirBuf(oldParentCluster, oldBuf)
 	}
 
@@ -523,7 +528,7 @@ func (fs *exfatFS) Rename(oldPath, newPath string) error {
 	if freeOff < 0 {
 		return fmt.Errorf("exfat: destination directory is full")
 	}
-	copy(newBuf[freeOff:], makeExFATEntrySet(newName, oldAttrs, oldCluster, oldSize))
+	copy(newBuf[freeOff:], fs.entrySet(newName, oldAttrs, oldCluster, oldSize))
 	return fs.writeDirBuf(newParentCluster, newBuf)
 }
 
@@ -1285,6 +1290,12 @@ func (fs *exfatFS) writeRootDir(buf []byte) error {
 // have an out-of-range Month or Day field — leaving them zero (=> month
 // 0, day 0) yields an "Invalid file name in /" report.
 func makeExFATEntrySet(name string, attrs uint16, cluster uint32, size uint64) []byte {
+	return makeExFATEntrySetHashed(name, attrs, cluster, size, exfatNameHash(name))
+}
+
+// makeExFATEntrySetHashed is makeExFATEntrySet with the NameHash given (the
+// volume's table decides it, see upcase.go).
+func makeExFATEntrySetHashed(name string, attrs uint16, cluster uint32, size uint64, hash uint16) []byte {
 	nameWords := utf16.Encode([]rune(name))
 	numNameEntries := (len(nameWords) + nameCharsPerEntry - 1) / nameCharsPerEntry
 	secondaryCount := uint8(1 + numNameEntries)
@@ -1307,7 +1318,7 @@ func makeExFATEntrySet(name string, attrs uint16, cluster uint32, size uint64) [
 	// for every file we emit, so external implementations can rely on it.
 	s[1] = 1
 	s[3] = uint8(len(nameWords))
-	le.PutUint16(s[4:6], exfatNameHash(name))
+	le.PutUint16(s[4:6], hash)
 	le.PutUint64(s[8:16], size)
 	le.PutUint32(s[20:24], cluster)
 	le.PutUint64(s[24:32], size)
@@ -1361,18 +1372,6 @@ func exfatEncodeTimestamp(t time.Time) uint32 {
 		(uint32(t.Hour()) << 11) |
 		(uint32(t.Minute()) << 5) |
 		(uint32(t.Second()) / 2)
-}
-
-// exfatNameHash computes the exFAT name hash for an uppercase UTF-16LE name.
-func exfatNameHash(name string) uint16 {
-	var hash uint16
-	for _, w := range utf16.Encode([]rune(strings.ToUpper(name))) {
-		hash = (hash >> 1) | (hash << 15)
-		hash += uint16(w & 0xFF)
-		hash = (hash >> 1) | (hash << 15)
-		hash += uint16(w >> 8)
-	}
-	return hash
 }
 
 // exfatEntrySetChecksum computes the checksum over all entries in an entry set.
