@@ -996,8 +996,12 @@ func (fs *exfatFS) readClusterChain(start uint32, size uint64) ([]byte, error) {
 	// the correct outcome for an over-long declared length. The buffer starts
 	// empty and grows incrementally as clusters are appended, so no single
 	// huge allocation is ever made (finding C2).
+	// The clamp is a comparison. It used to be safeio.MakeBytes, which
+	// ALLOCATES and zeroes `size` bytes just to learn whether they fit: every
+	// path component of every Stat/ReadFile paid for a maxDirBytes buffer it
+	// threw away, 80% of a metadata walk (#39).
 	capBytes := fs.maxChainBytes()
-	if _, err := safeio.MakeBytes(int64(size), int64(capBytes)); err != nil {
+	if size > capBytes {
 		size = capBytes
 	}
 	buf := make([]byte, 0)
