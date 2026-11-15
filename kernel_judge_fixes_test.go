@@ -3,6 +3,7 @@ package filesystem_exfat
 import (
 	"encoding/binary"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -131,5 +132,41 @@ func TestMissingTableFallsBackToTheKernelsFolding(t *testing.T) {
 	}
 	if got := decodeUpcase([]byte{0xFF, 0xFF}); got[0xFFFF] != 0xFFFF || got[5] != 5 {
 		t.Error("a trailing 0xFFFF changed the table")
+	}
+}
+
+// A Stat or ReadFile resolves its path by reading the directories on it; the
+// bound on the chain length used to be tested with safeio.MakeBytes, which
+// allocates and zeroes that many bytes: a metadata walk paid for a buffer of the
+// directory ceiling per path component (#39, 25x slower than the kernel).
+func TestStatDoesNotAllocateTheDirectoryCeiling(t *testing.T) {
+	f, err := Format(filepath.Join(t.TempDir(), "a.img"), 256<<20, FormatConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, p := range []string{"/d", "/d/e"} {
+		if err := f.MkDir(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.WriteFile("/d/e/f", []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const n = 200
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < n; i++ {
+		if _, err := f.Stat("/d/e/f"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.ReadFile("/d/e/f"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if per := (after.TotalAlloc - before.TotalAlloc) / (2 * n); per > 256<<10 {
+		t.Errorf("a Stat/ReadFile of a 3-component path allocates %d bytes on average; it should be a few directory clusters", per)
 	}
 }

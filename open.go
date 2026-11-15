@@ -129,7 +129,7 @@ func (fs *exfatFS) chainClusters(start uint32, size uint64) ([]uint32, int64, er
 	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
 
 	capBytes := fs.maxChainBytes()
-	if _, err := safeio.MakeBytes(int64(size), int64(capBytes)); err != nil {
+	if size > capBytes { // a comparison: MakeBytes allocated `size` bytes to answer this (#39)
 		size = capBytes
 	}
 

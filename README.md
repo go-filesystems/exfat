@@ -65,9 +65,12 @@ the cluster now grows with the volume so the one-cluster bitmap fits),
 length 0: the kernel saw them empty) and
 [#36](https://github.com/go-filesystems/exfat/issues/36) (the name hash now follows
 the volume's own Up-case Table, as the kernel and fsck.exfat compute it). Against
-the kernel on one image (4000 small files, a 256 MiB file): metadata walk 486
-files/s against 13549 for the kernel; the sequential read figure is not a storage
-comparison (host-cached VM disk), see the kerneljudge README.
+the kernel on one image (4000 small files, a 256 MiB file; medians of 7 rounds):
+metadata walk 9882 files/s against 13197 for the kernel (it was 564 files/s, 25x
+slower, before [#39](https://github.com/go-filesystems/exfat/issues/39): every
+path component allocated and zeroed a directory-ceiling buffer only to bound-check
+it); the sequential read figure is not a storage comparison (host-cached VM
+disk), see the kerneljudge README.
 
 ## Limitations
 
