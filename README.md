@@ -57,13 +57,14 @@ The Linux kernel (6.17) and exfatprogs 1.2.2, run as root in a Tart VM by
 `FS_KERNEL_JUDGE=1`). Each image is held to a fixed corpus (nested directories,
 UTF-8 names, a sparse and a 32 MiB file, times) by `fsck.exfat -n`, a read-only
 kernel mount and this reader, for images written by this driver and, in reverse,
-by `mkfs.exfat` plus a kernel read-write mount (clean). Open defects found this
-way, logged as `KNOWN DEFECT` by the test:
-[#34](https://github.com/go-filesystems/exfat/issues/34) (`Format` over 128 MiB),
+by `mkfs.exfat` plus a kernel read-write mount: both directions are clean, with
+no known defect. It found, and this release fixed,
+[#34](https://github.com/go-filesystems/exfat/issues/34) (`Format` over 128 MiB:
+the cluster now grows with the volume so the one-cluster bitmap fits),
 [#35](https://github.com/go-filesystems/exfat/issues/35) (directories written with
-length 0: the kernel sees them empty),
-[#36](https://github.com/go-filesystems/exfat/issues/36) (wrong name hash for
-non-ASCII Latin letters). Root-level files compare equal byte for byte. Against
+length 0: the kernel saw them empty) and
+[#36](https://github.com/go-filesystems/exfat/issues/36) (the name hash now follows
+the volume's own Up-case Table, as the kernel and fsck.exfat compute it). Against
 the kernel on one image (4000 small files, a 256 MiB file): metadata walk 486
 files/s against 13549 for the kernel; the sequential read figure is not a storage
 comparison (host-cached VM disk), see the kerneljudge README.

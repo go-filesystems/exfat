@@ -73,13 +73,19 @@ var formatOpenFS = Open
 // caller must Close it when done.
 func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesystem, error) {
 	const bytesPerSector = 1 << fmtBytesPerSectorShift
-	const sectorsPerCluster = 1 << fmtSectorsPerClusterShift
-	const clusterSize = bytesPerSector * sectorsPerCluster
-
-	if sizeBytes%clusterSize != 0 {
-		return nil, fmt.Errorf("exfat: format: size %d is not a multiple of cluster size %d",
-			sizeBytes, clusterSize)
+	if sizeBytes%4096 != 0 {
+		return nil, fmt.Errorf("exfat: format: size %d is not a multiple of 4096", sizeBytes)
 	}
+	// The allocation bitmap lives in ONE cluster (the layout below): pick the
+	// smallest cluster size, from 4 KiB up, whose single cluster holds one bit
+	// per cluster of the volume. mkfs.exfat likewise grows the cluster with the
+	// volume; a fixed 4 KiB cluster is why Format stopped at 128 MiB (#34).
+	sectorShift := uint(fmtSectorsPerClusterShift)
+	for sectorShift < 16 && (uint64(sizeBytes)>>(fmtBytesPerSectorShift+sectorShift)+7)/8 > uint64(bytesPerSector)<<sectorShift {
+		sectorShift++
+	}
+	sectorsPerCluster := uint64(1) << sectorShift
+	clusterSize := int64(bytesPerSector) * int64(sectorsPerCluster)
 
 	totalSectors := uint64(sizeBytes) / bytesPerSector
 
@@ -180,7 +186,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	le.PutUint16(boot[104:], 0x0100) // revision 1.00
 	// VolumeFlags = 0, DriveSelect = 0x80
 	boot[108] = fmtBytesPerSectorShift
-	boot[109] = fmtSectorsPerClusterShift
+	boot[109] = byte(sectorShift)
 	boot[110] = fmtNumberOfFATs
 	boot[111] = 0x80 // DriveSelect
 	boot[112] = 0xFF // PercentInUse: unknown
