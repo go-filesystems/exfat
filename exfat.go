@@ -970,7 +970,7 @@ func (fs *exfatFS) maxChainBytes() uint64 {
 // size bytes. It is hardened against malicious/corrupt images:
 //
 //   - the requested size is clamped to the heap capacity (maxChainBytes) and
-//     the backing buffer is allocated through safeio.MakeBytes, so an
+//     the size is compared with it (no allocation), so an
 //     attacker dataLength such as 2^63 yields a bounded allocation, not OOM
 //     (finding C2);
 //   - a safeio.VisitSet rejects a self-referential or cyclic FAT chain, and a
@@ -990,9 +990,8 @@ func (fs *exfatFS) readClusterChain(start uint32, size uint64) ([]byte, error) {
 	// Bound the caller-/attacker-supplied size against what the heap can
 	// actually hold. maxChainBytes is ClusterCount (uint32) × ClusterSize
 	// (≤ 32 MiB), so it is always well below 2^63 and fits in int64.
-	// safeio.MakeBytes rejects a size that exceeds that cap (or that
-	// overflows int64, e.g. an attacker dataLength of 2^63); when it does, we
-	// clamp to the cap and continue rather than fail, since a short read is
+	// A size above that cap (e.g. an attacker dataLength of 2^63) is clamped
+	// to it and the walk continues rather than fails, since a short read is
 	// the correct outcome for an over-long declared length. The buffer starts
 	// empty and grows incrementally as clusters are appended, so no single
 	// huge allocation is ever made (finding C2).
