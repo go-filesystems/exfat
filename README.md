@@ -49,6 +49,25 @@ single bytes (about `2*log2(size)` reads).
 `FuzzOpenAndWalk` drives the read surface; the regression tests are in
 `bombs_test.go`.
 
+## Judged by
+
+The Linux kernel (6.17) and exfatprogs 1.2.2, run as root in a Tart VM by
+[kerneljudge](https://github.com/go-filesystems/kerneljudge) (`kerneljudge run
+--driver <clone>`; the test is `kerneljudge_test.go`, behind
+`FS_KERNEL_JUDGE=1`). Each image is held to a fixed corpus (nested directories,
+UTF-8 names, a sparse and a 32 MiB file, times) by `fsck.exfat -n`, a read-only
+kernel mount and this reader, for images written by this driver and, in reverse,
+by `mkfs.exfat` plus a kernel read-write mount (clean). Open defects found this
+way, logged as `KNOWN DEFECT` by the test:
+[#34](https://github.com/go-filesystems/exfat/issues/34) (`Format` over 128 MiB),
+[#35](https://github.com/go-filesystems/exfat/issues/35) (directories written with
+length 0: the kernel sees them empty),
+[#36](https://github.com/go-filesystems/exfat/issues/36) (wrong name hash for
+non-ASCII Latin letters). Root-level files compare equal byte for byte. Against
+the kernel on one image (4000 small files, a 256 MiB file): metadata walk 486
+files/s against 13549 for the kernel; the sequential read figure is not a storage
+comparison (host-cached VM disk), see the kerneljudge README.
+
 ## Limitations
 
 - exFAT does not support POSIX symlinks or POSIX permissions/ACLs.
