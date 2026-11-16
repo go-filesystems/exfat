@@ -16,6 +16,7 @@ Supports bare filesystem images and MBR/GPT partitioned disks, full directory tr
 |---|---:|---|
 | Open / Close | ✅ | Supports bare images and partitioned disks |
 | Format | ✅ | Creates exFAT images |
+| FormatImage | ✅ | Formats any `io.ReaderAt` + `io.WriterAt` in process, no file on disk |
 | ReadFile | ✅ | Full file reads supported |
 | Read at an offset | ✅ | `OpenFile(path)` → `io.ReaderAt` + `Size()` (`filesystem.Opener` / `filesystem.File`) |
 | Write at an offset | ✅ | `OpenFile(path)` → `io.WriterAt` + `Truncate` + `Sync` (`filesystem.WritableFile`). Writes only the bytes given; a length change materialises a `NoFatChain` run into a real FAT chain first |
@@ -90,6 +91,7 @@ github.com/go-filesystems/exfat
 |--------------|----------------|
 | Open / Close | ✅ implemented |
 | Format       | ✅ implemented |
+| FormatImage  | ✅ implemented (format any `io.ReaderAt` + `io.WriterAt`, no file) |
 | Stat         | ✅ implemented |
 | ListDir      | ✅ implemented |
 | ReadFile     | ✅ implemented |
@@ -119,8 +121,18 @@ type FormatConfig struct {
 }
 
 func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesystem, error)
+func FormatImage(rw ReaderWriterAt, sizeBytes int64, cfg FormatConfig) (filesystem.Filesystem, error)
 func Open(imagePath string, partIndex int) (filesystem.Filesystem, error)
 ```
+
+`FormatImage` lays the same filesystem onto anything that is an `io.ReaderAt`
+plus an `io.WriterAt` of at least `sizeBytes` — an encrypted volume, a buffer in
+memory, a partition inside a larger image — and writes no file on disk. It
+clears every region an exFAT reader interprets (boot regions, FAT, bitmap,
+up-case table, root directory), so a reused buffer leaks nothing, and the result
+is byte-identical to the file `Format` writes for the same size and config.
+`Format` is a thin wrapper over the same code. The returned filesystem reads and
+writes through `rw` and does not close it.
 
 ### Read / Write
 
