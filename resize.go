@@ -21,6 +21,7 @@ type resizeFile interface {
 // system files. The boot region and its backup are rewritten with the
 // new VolumeLength / ClusterCount and a fresh Boot Checksum.
 func (fs *exfatFS) Grow(newSizeBytes int64) error {
+	fs.entries.drop()
 	return fs.resize(newSizeBytes, false)
 }
 
@@ -31,6 +32,7 @@ func (fs *exfatFS) Grow(newSizeBytes int64) error {
 // VolumeLength, or when it isn't cluster-aligned. On success the boot
 // region, backup, bitmap header, and backing file are all updated.
 func (fs *exfatFS) Shrink(newSizeBytes int64) error {
+	fs.entries.drop()
 	return fs.resize(newSizeBytes, true)
 }
 
