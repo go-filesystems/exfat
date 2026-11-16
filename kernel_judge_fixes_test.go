@@ -275,20 +275,34 @@ func TestDirectoryCacheNeverHidesAWrite(t *testing.T) {
 func TestEntryCacheIsBoundedInBytes(t *testing.T) {
 	var c entryCache
 	big := make([]rootDirEntry, maxCachedEntryBytes/entrySlot/2+1)
-	c.put(1, big)
-	c.put(2, big)
+	c.put(1, big, 0)
+	c.put(2, big, 0)
 	if _, ok := c.get(1); ok {
 		t.Error("the cache grew past its byte budget")
 	}
 	if c.bytes > maxCachedEntryBytes {
 		t.Errorf("%d bytes held, budget %d", c.bytes, maxCachedEntryBytes)
 	}
-	c.put(3, make([]rootDirEntry, maxCachedEntryBytes/entrySlot+1))
+	c.put(3, make([]rootDirEntry, maxCachedEntryBytes/entrySlot+1), 0)
 	if _, ok := c.get(3); ok {
 		t.Error("a directory costing more than the whole budget was cached")
 	}
 	c.drop()
 	if _, ok := c.get(2); ok || c.bytes != 0 {
 		t.Error("drop kept entries")
+	}
+}
+
+func TestEntryCacheRefusesAViewReadBeforeAWrite(t *testing.T) {
+	var c entryCache
+	gen := c.generation()
+	c.drop() // a directory write happens while a reader is still parsing
+	c.put(1, []rootDirEntry{{name: "old"}}, gen)
+	if _, ok := c.get(1); ok {
+		t.Error("a view read before a write was stored after it")
+	}
+	c.put(1, []rootDirEntry{{name: "new"}}, c.generation())
+	if es, ok := c.get(1); !ok || es[0].name != "new" {
+		t.Error("a current view was refused")
 	}
 }

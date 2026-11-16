@@ -1247,6 +1247,7 @@ func (fs *exfatFS) setFATEntry(cluster uint32, value uint32) error {
 // and (when a bitmap is present) clears their bitmap bits to keep the FAT
 // and Allocation Bitmap in sync.
 func (fs *exfatFS) freeChain(start uint32) error {
+	fs.entries.drop() // freed clusters may be reused: no cached directory may point at them
 	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
 	// Bound the walk to ClusterCount+1 iterations and reject a cyclic /
 	// self-referential chain, so a corrupt FAT cannot make freeChain loop
