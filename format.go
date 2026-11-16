@@ -2,7 +2,9 @@ package filesystem_exfat
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 
@@ -72,9 +74,56 @@ var formatOpenFS = Open
 // On success the newly formatted filesystem is opened and returned; the
 // caller must Close it when done.
 func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesystem, error) {
+	l, err := formatLayout(sizeBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := formatOpenFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("exfat: format: %w", err)
+	}
+	if err := f.Truncate(sizeBytes); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("exfat: format: truncate: %w", err)
+	}
+
+	// A file just truncated to its size reads back as zeros, so only the
+	// metadata that is not zero is written.
+	if err := writeFormat(f, l, cfg, false); err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("exfat: format: close: %w", err)
+	}
+
+	fs, err := formatOpenFS(path, -1)
+	if err != nil {
+		return nil, err
+	}
+	return seedLabel(fs, cfg)
+}
+
+// fmtLayout is the geometry of a volume of a given size.
+type fmtLayout struct {
+	totalSectors      uint64
+	sectorShift       uint
+	fatLength         uint64
+	clusterHeapOffset uint64
+	clusterCount      uint32
+}
+
+// formatLayout validates sizeBytes and computes the volume geometry, shared by
+// Format and FormatImage so both refuse the same sizes.
+func formatLayout(sizeBytes int64) (fmtLayout, error) {
 	const bytesPerSector = 1 << fmtBytesPerSectorShift
+	if sizeBytes <= 0 {
+		return fmtLayout{}, fmt.Errorf("exfat: format: size %d too small", sizeBytes)
+	}
 	if sizeBytes%4096 != 0 {
-		return nil, fmt.Errorf("exfat: format: size %d is not a multiple of 4096", sizeBytes)
+		return fmtLayout{}, fmt.Errorf("exfat: format: size %d is not a multiple of 4096", sizeBytes)
 	}
 	// The allocation bitmap lives in ONE cluster (the layout below): pick the
 	// smallest cluster size, from 4 KiB up, whose single cluster holds one bit
@@ -85,7 +134,6 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 		sectorShift++
 	}
 	sectorsPerCluster := uint64(1) << sectorShift
-	clusterSize := int64(bytesPerSector) * int64(sectorsPerCluster)
 
 	totalSectors := uint64(sizeBytes) / bytesPerSector
 
@@ -110,22 +158,122 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	}
 
 	if totalSectors <= clusterHeapOffset {
-		return nil, fmt.Errorf("exfat: format: size %d too small", sizeBytes)
+		return fmtLayout{}, fmt.Errorf("exfat: format: size %d too small", sizeBytes)
 	}
 	clusterCount := uint32((totalSectors - clusterHeapOffset) / sectorsPerCluster)
 	if clusterCount < 1 {
-		return nil, fmt.Errorf("exfat: format: size %d too small", sizeBytes)
+		return fmtLayout{}, fmt.Errorf("exfat: format: size %d too small", sizeBytes)
 	}
 	// We need at least 3 data clusters (bitmap, up-case, root). Reject sizes
 	// that can't satisfy the mandatory system-file layout.
 	if clusterCount < 3 {
-		return nil, fmt.Errorf("exfat: format: size %d leaves only %d data clusters; need ≥3 for bitmap+upcase+root", sizeBytes, clusterCount)
+		return fmtLayout{}, fmt.Errorf("exfat: format: size %d leaves only %d data clusters; need ≥3 for bitmap+upcase+root", sizeBytes, clusterCount)
 	}
+
+	return fmtLayout{
+		totalSectors:      totalSectors,
+		sectorShift:       sectorShift,
+		fatLength:         fatLength,
+		clusterHeapOffset: clusterHeapOffset,
+		clusterCount:      clusterCount,
+	}, nil
+}
+
+// ReaderWriterAt is the image FormatImage formats: anything that can be read
+// and written at an offset, such as a buffer in memory.
+type ReaderWriterAt interface {
+	io.ReaderAt
+	io.WriterAt
+}
+
+// FormatImage creates a new exFAT filesystem in the first sizeBytes of rw and
+// opens it, with the same layout and size rules as Format.
+//
+// It is Format without a path: for a caller that has no host file to give --
+// an encrypted volume, a WebAssembly page building an image in memory, a test,
+// a partition inside a larger image. rw must already hold at least sizeBytes
+// (a shorter one is refused); FormatImage never grows it, and writes no file
+// on disk.
+//
+// Unlike Format, which writes a file it has just truncated, FormatImage cannot
+// assume rw reads back as zeros. It therefore writes zeros over every region
+// an exFAT reader interprets -- the boot regions, the FAT, the allocation
+// bitmap, the up-case table and the root directory cluster -- so a reused
+// buffer holding an older volume does not leak entries into the new one. Data
+// clusters past the root directory are left as they are: they are free in the
+// new bitmap, and nothing reads a free cluster. An image formatted this way is
+// byte-identical to the file Format produces for the same size and cfg, in
+// every byte that region covers.
+//
+// The returned filesystem reads and writes through rw (see OpenReader); it
+// does not close rw.
+func FormatImage(rw ReaderWriterAt, sizeBytes int64, cfg FormatConfig) (filesystem.Filesystem, error) {
+	if rw == nil {
+		return nil, errors.New("exfat: format: FormatImage needs an image")
+	}
+	l, err := formatLayout(sizeBytes)
+	if err != nil {
+		return nil, err
+	}
+	// The image must really reach sizeBytes: the metadata sits at the front,
+	// so a short image would format cleanly and fail later, far from here.
+	var last [1]byte
+	if n, err := rw.ReadAt(last[:], sizeBytes-1); n != 1 {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("exfat: format: image is shorter than %d bytes: %w", sizeBytes, err)
+	}
+	if err := writeFormat(rw, l, cfg, true); err != nil {
+		return nil, err
+	}
+	fs, err := OpenReader(rw, sizeBytes)
+	if err != nil {
+		return nil, err
+	}
+	return seedLabel(fs, cfg)
+}
+
+// fmtZeroChunk bounds the buffer used to zero the metadata regions, so
+// formatting a large image does not allocate the size of its FAT.
+const fmtZeroChunk = 64 << 10
+
+// zeroRange writes n zero bytes at off, in chunks of at most fmtZeroChunk.
+func zeroRange(w io.WriterAt, off, n int64) error {
+	buf := make([]byte, min(n, fmtZeroChunk))
+	for n > 0 {
+		k := min(n, int64(len(buf)))
+		if _, err := w.WriteAt(buf[:k], off); err != nil {
+			return err
+		}
+		off += k
+		n -= k
+	}
+	return nil
+}
+
+// writeFormat writes every non-zero structure of a fresh volume to f. With
+// zero set it first clears everything from sector 0 through the root directory
+// cluster, for a target that cannot be assumed to read back as zeros.
+func writeFormat(f io.WriterAt, l fmtLayout, cfg FormatConfig, zero bool) error {
+	const bytesPerSector = 1 << fmtBytesPerSectorShift
+	sectorShift := l.sectorShift
+	fatLength := l.fatLength
+	clusterHeapOffset := l.clusterHeapOffset
+	clusterCount := l.clusterCount
+	totalSectors := l.totalSectors
+	clusterSize := int64(bytesPerSector) << sectorShift
 
 	// dataClusterOffset returns the absolute byte offset of the start of
 	// cluster c within the cluster heap. Cluster indices are 2-based.
 	dataClusterOffset := func(c uint32) int64 {
 		return int64(clusterHeapOffset)*bytesPerSector + int64(c-2)*clusterSize
+	}
+
+	if zero {
+		if err := zeroRange(f, 0, dataClusterOffset(fmtRootDirCluster)+clusterSize); err != nil {
+			return fmt.Errorf("exfat: format: clear metadata: %w", err)
+		}
 	}
 
 	serialNumber := cfg.VolumeSerialNumber
@@ -134,15 +282,6 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 		if serialNumber == 0 {
 			serialNumber = 0xDEADBEEF
 		}
-	}
-
-	f, err := formatOpenFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("exfat: format: %w", err)
-	}
-	if err := f.Truncate(sizeBytes); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: truncate: %w", err)
 	}
 
 	le := binary.LittleEndian
@@ -193,8 +332,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	boot[510] = 0x55
 	boot[511] = 0xAA
 	if _, err := f.WriteAt(boot, 0); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: write boot sector: %w", err)
+		return fmt.Errorf("exfat: format: write boot sector: %w", err)
 	}
 
 	// ── Extended boot sectors (sectors 1..8) ─────────────────────────────────
@@ -211,8 +349,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	extBoot[511] = 0xAA
 	for sector := int64(1); sector <= 8; sector++ {
 		if _, err := f.WriteAt(extBoot, sector*bytesPerSector); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("exfat: format: write extended boot sector %d: %w", sector, err)
+			return fmt.Errorf("exfat: format: write extended boot sector %d: %w", sector, err)
 		}
 	}
 
@@ -222,8 +359,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	zeroSector := make([]byte, bytesPerSector)
 	for _, sector := range []int64{9, 10} {
 		if _, err := f.WriteAt(zeroSector, sector*bytesPerSector); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("exfat: format: write boot-region sector %d: %w", sector, err)
+			return fmt.Errorf("exfat: format: write boot-region sector %d: %w", sector, err)
 		}
 	}
 
@@ -245,8 +381,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 		le.PutUint32(checksumSector[offset:], checksum)
 	}
 	if _, err := f.WriteAt(checksumSector, 11*bytesPerSector); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: write boot checksum sector: %w", err)
+		return fmt.Errorf("exfat: format: write boot checksum sector: %w", err)
 	}
 
 	// ── Backup boot region (sectors 12..23) ─────────────────────────────────
@@ -254,24 +389,20 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	// Apple's fsck_exfat falls back to it when the main region fails to
 	// validate, so we must mirror every sector — not just the boot sector.
 	if _, err := f.WriteAt(mainBoot, 12*bytesPerSector); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: write backup main boot sector: %w", err)
+		return fmt.Errorf("exfat: format: write backup main boot sector: %w", err)
 	}
 	for sector := int64(1); sector <= 8; sector++ {
 		if _, err := f.WriteAt(extBoot, (12+sector)*bytesPerSector); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("exfat: format: write backup extended boot sector %d: %w", sector, err)
+			return fmt.Errorf("exfat: format: write backup extended boot sector %d: %w", sector, err)
 		}
 	}
 	for _, sector := range []int64{9, 10} {
 		if _, err := f.WriteAt(zeroSector, (12+sector)*bytesPerSector); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("exfat: format: write backup boot-region sector %d: %w", sector, err)
+			return fmt.Errorf("exfat: format: write backup boot-region sector %d: %w", sector, err)
 		}
 	}
 	if _, err := f.WriteAt(checksumSector, (12+11)*bytesPerSector); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: write backup boot checksum sector: %w", err)
+		return fmt.Errorf("exfat: format: write backup boot checksum sector: %w", err)
 	}
 
 	// ── FAT ───────────────────────────────────────────────────────────────────
@@ -287,8 +418,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	le.PutUint32(fatBuf[16:], 0xFFFFFFFF) // FAT[4] root EOC
 	fatOff := int64(fmtFATOffset) * bytesPerSector
 	if _, err := f.WriteAt(fatBuf, fatOff); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: write FAT: %w", err)
+		return fmt.Errorf("exfat: format: write FAT: %w", err)
 	}
 
 	// ── Allocation Bitmap (cluster 2) ────────────────────────────────────────
@@ -296,16 +426,14 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	// 3 and 4 (bitmap, upcase, root) allocated; everything else is free.
 	bitmapSizeBytes := (uint64(clusterCount) + 7) / 8
 	if bitmapSizeBytes > uint64(clusterSize) {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: bitmap size %d exceeds one cluster", bitmapSizeBytes)
+		return fmt.Errorf("exfat: format: bitmap size %d exceeds one cluster", bitmapSizeBytes)
 	}
 	bitmap := make([]byte, clusterSize)
 	// Bit i corresponds to cluster (i+2). Mark first three system clusters.
 	bitmap[0] = 0b0000_0111
 	bitmapOff := dataClusterOffset(fmtBitmapCluster)
 	if _, err := f.WriteAt(bitmap, bitmapOff); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: write allocation bitmap: %w", err)
+		return fmt.Errorf("exfat: format: write allocation bitmap: %w", err)
 	}
 
 	// ── Up-case Table (cluster 3) ────────────────────────────────────────────
@@ -327,8 +455,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	copy(upcaseClusterBuf, upcaseTable)
 	upcaseOff := dataClusterOffset(fmtUpcaseCluster)
 	if _, err := f.WriteAt(upcaseClusterBuf, upcaseOff); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: write up-case table: %w", err)
+		return fmt.Errorf("exfat: format: write up-case table: %w", err)
 	}
 
 	// ── Root Directory (cluster 4) ───────────────────────────────────────────
@@ -349,18 +476,14 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (filesystem.Filesyst
 	le.PutUint64(rootBuf[dirEntrySize+24:], uint64(len(upcaseTable)))
 	rootOff := dataClusterOffset(fmtRootDirCluster)
 	if _, err := f.WriteAt(rootBuf, rootOff); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("exfat: format: write root directory: %w", err)
+		return fmt.Errorf("exfat: format: write root directory: %w", err)
 	}
 
-	if err := f.Close(); err != nil {
-		return nil, fmt.Errorf("exfat: format: close: %w", err)
-	}
+	return nil
+}
 
-	fs, err := formatOpenFS(path, -1)
-	if err != nil {
-		return nil, err
-	}
+// seedLabel stores cfg.Label on a freshly opened filesystem, when one is set.
+func seedLabel(fs filesystem.Filesystem, cfg FormatConfig) (filesystem.Filesystem, error) {
 	if cfg.Label != "" {
 		// formatOpenFS returns filesystem.Filesystem; the Labeller
 		// capability is the typed gateway to SetLabel.
