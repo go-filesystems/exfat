@@ -2,6 +2,7 @@ package filesystem_exfat
 
 import (
 	"encoding/binary"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -168,5 +169,126 @@ func TestStatDoesNotAllocateTheDirectoryCeiling(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	if per := (after.TotalAlloc - before.TotalAlloc) / (2 * n); per > 256<<10 {
 		t.Errorf("a Stat/ReadFile of a 3-component path allocates %d bytes on average; it should be a few directory clusters", per)
+	}
+}
+
+type readCounter struct {
+	diskRW
+	n *int
+}
+
+func (r readCounter) ReadAt(p []byte, off int64) (int, error) {
+	*r.n++
+	return r.diskRW.ReadAt(p, off)
+}
+
+// Path resolution used to read and parse the directory of every component on
+// every Stat (#44); once the directories are cached a repeated Stat costs no
+// device read, and a write must never be hidden by the cache.
+func TestStatOfKnownDirectoriesCostsNoDeviceRead(t *testing.T) {
+	f, err := Format(filepath.Join(t.TempDir(), "a.img"), 64<<20, FormatConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fs := f.(*exfatFS)
+	if err := f.MkDir("/d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		if err := f.WriteFile(fmt.Sprintf("/d/f%02d", i), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reads := 0
+	fs.f = readCounter{fs.f, &reads}
+	for i := 0; i < 40; i++ { // warm
+		if _, err := f.Stat(fmt.Sprintf("/d/f%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reads = 0
+	for i := 0; i < 40; i++ {
+		if _, err := f.Stat(fmt.Sprintf("/d/f%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if reads != 0 {
+		t.Errorf("40 Stats of known paths cost %d device reads: the parsed directories are not cached", reads)
+	}
+}
+
+func TestDirectoryCacheNeverHidesAWrite(t *testing.T) {
+	f, err := Format(filepath.Join(t.TempDir(), "a.img"), 64<<20, FormatConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(f.MkDir("/d", 0o755))
+	must(f.WriteFile("/d/a", []byte("one"), 0o644))
+	if _, err := f.Stat("/d/a"); err != nil { // caches / and /d
+		t.Fatal(err)
+	}
+	if _, err := f.Stat("/d/b"); err == nil {
+		t.Fatal("b exists before it is written")
+	}
+	must(f.WriteFile("/d/b", []byte("two"), 0o644))
+	if st, err := f.Stat("/d/b"); err != nil || st.Size() != 3 {
+		t.Fatalf("a new file is invisible or wrong: %v", err)
+	}
+	must(f.WriteFile("/d/a", []byte("longer"), 0o644))
+	if st, err := f.Stat("/d/a"); err != nil || st.Size() != 6 {
+		t.Fatalf("an overwritten file keeps its old size: %v", err)
+	}
+	must(f.Rename("/d/a", "/d/c"))
+	if _, err := f.Stat("/d/a"); err == nil {
+		t.Error("a renamed file is still found under its old name")
+	}
+	if _, err := f.Stat("/d/c"); err != nil {
+		t.Errorf("a renamed file is not found under its new name: %v", err)
+	}
+	must(f.DeleteFile("/d/b"))
+	if _, err := f.Stat("/d/b"); err == nil {
+		t.Error("a deleted file is still found")
+	}
+	must(f.DeleteFile("/d/c"))
+	must(f.DeleteDir("/d"))
+	if _, err := f.Stat("/d"); err == nil {
+		t.Error("a deleted directory is still found")
+	}
+	must(f.MkDir("/d", 0o755)) // the cluster may be reused
+	must(f.WriteFile("/d/z", []byte("z"), 0o644))
+	if _, err := f.Stat("/d/c"); err == nil {
+		t.Error("the new directory shows an entry of the deleted one")
+	}
+	if _, err := f.Stat("/d/z"); err != nil {
+		t.Errorf("the new directory's file is invisible: %v", err)
+	}
+}
+
+func TestEntryCacheIsBoundedInBytes(t *testing.T) {
+	var c entryCache
+	big := make([]rootDirEntry, maxCachedEntryBytes/entrySlot/2+1)
+	c.put(1, big)
+	c.put(2, big)
+	if _, ok := c.get(1); ok {
+		t.Error("the cache grew past its byte budget")
+	}
+	if c.bytes > maxCachedEntryBytes {
+		t.Errorf("%d bytes held, budget %d", c.bytes, maxCachedEntryBytes)
+	}
+	c.put(3, make([]rootDirEntry, maxCachedEntryBytes/entrySlot+1))
+	if _, ok := c.get(3); ok {
+		t.Error("a directory costing more than the whole budget was cached")
+	}
+	c.drop()
+	if _, ok := c.get(2); ok || c.bytes != 0 {
+		t.Error("drop kept entries")
 	}
 }

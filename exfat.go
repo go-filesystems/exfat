@@ -122,6 +122,9 @@ type exfatFS struct {
 	bitmapLength  uint64
 	// upcase is the volume's Up-case Table, loaded on the first write.
 	upcase []uint16
+	// entries caches parsed directories for path resolution; dropped on every
+	// directory write (see dircache.go).
+	entries entryCache
 }
 
 var (
@@ -849,6 +852,8 @@ func (fs *exfatFS) readDirBuf(startCluster uint32) ([]byte, error) {
 
 // writeDirBuf writes buf back to the cluster chain starting at startCluster.
 func (fs *exfatFS) writeDirBuf(startCluster uint32, buf []byte) error {
+	fs.entries.drop()
+	defer fs.entries.drop()
 	clusterSize := int64(fs.info.ClusterSize())
 	dataBase := fs.info.ClusterHeapOffsetBytes(fs.partOffset)
 	fatBase := fs.info.FATOffsetBytes(fs.partOffset)
@@ -904,11 +909,7 @@ func (fs *exfatFS) resolvePath(path string) (rootDirEntry, uint32, error) {
 	var result rootDirEntry
 	var parentCluster uint32
 	for i, name := range parts {
-		buf, err := fs.readDirBuf(curCluster)
-		if err != nil {
-			return rootDirEntry{}, 0, err
-		}
-		entries, err := parseRootDirMetadata(buf)
+		entries, err := fs.dirEntries(curCluster)
 		if err != nil {
 			return rootDirEntry{}, 0, err
 		}
