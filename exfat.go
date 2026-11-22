@@ -377,9 +377,62 @@ func (fs *exfatFS) DeleteFile(path string) error {
 	return fs.writeDirBuf(parentCluster, rootBuf)
 }
 
+// exfatTreeNode is a directory entry seen by checkDirTree, identified by its
+// first cluster.
+type exfatTreeNode struct {
+	cluster uint32
+	dir     bool
+}
+
+// checkDirTree walks the tree under the directory at dirCluster WITHOUT
+// recursion, before deleteAllContents changes anything, and refuses an image
+// whose directories form a cycle (an entry naming an ancestor or the directory
+// itself), a directory reachable twice, or a nesting deeper than
+// safeio.MaxTreeDepth. Without it deleteAllContents recurses until the stack
+// overflows, a fatal error no recover() can catch.
+func (fs *exfatFS) checkDirTree(dirCluster uint32) error {
+	le := binary.LittleEndian
+	return safeio.PostOrder(exfatTreeNode{dirCluster, true},
+		func(n exfatTreeNode) (uint64, bool) { return uint64(n.cluster), n.dir },
+		func(n exfatTreeNode) ([]exfatTreeNode, error) {
+			// Only directories are ever nodes, so n.cluster is a directory.
+			buf, err := fs.readDirBuf(n.cluster)
+			if err != nil {
+				return nil, err
+			}
+			var kids []exfatTreeNode
+			for offset := 0; offset+dirEntrySize <= len(buf); offset += dirEntrySize {
+				entry := buf[offset : offset+dirEntrySize]
+				if entry[0] == exfatEntryEnd {
+					break
+				}
+				if entry[0] != exfatEntryFile {
+					continue
+				}
+				secondaryCount := int(entry[1])
+				if secondaryCount < 2 || offset+(secondaryCount+1)*dirEntrySize > len(buf) {
+					continue
+				}
+				stream := buf[offset+dirEntrySize : offset+2*dirEntrySize]
+				if stream[0] != exfatEntryStream {
+					continue
+				}
+				attrs := le.Uint16(entry[4:6])
+				cluster := le.Uint32(stream[20:24])
+				if attrs&uint16(exfatAttrDir) != 0 && cluster >= 2 {
+					kids = append(kids, exfatTreeNode{cluster, true})
+				}
+				offset += secondaryCount * dirEntrySize
+			}
+			return kids, nil
+		},
+		func(exfatTreeNode) error { return nil }, 0)
+}
+
 // deleteAllContents recursively removes all files and subdirectories inside the
 // directory at dirCluster, freeing their cluster chains. The directory cluster
-// itself is not freed; that is the caller's responsibility.
+// itself is not freed; that is the caller's responsibility. Its recursion is
+// bounded by checkDirTree, which DeleteDir runs first.
 func (fs *exfatFS) deleteAllContents(dirCluster uint32) error {
 	buf, err := fs.readDirBuf(dirCluster)
 	if err != nil {
@@ -441,6 +494,9 @@ func (fs *exfatFS) DeleteDir(path string) error {
 	stream := rootBuf[entryOff+dirEntrySize : entryOff+2*dirEntrySize]
 	firstCluster := binary.LittleEndian.Uint32(stream[20:24])
 	if firstCluster >= 2 {
+		if err := fs.checkDirTree(firstCluster); err != nil {
+			return fmt.Errorf("exfat: DeleteDir %q: %w", path, err)
+		}
 		if err := fs.deleteAllContents(firstCluster); err != nil {
 			return err
 		}
